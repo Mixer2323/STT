@@ -1,0 +1,10 @@
+{
+    "hotkey": "ctrl+shift",
+    "language": "auto",
+    "model": "medium",
+    "use_faster_whisper": true,
+    "device": "cpu",
+    "force_cpu": false,
+    "model_type": "faster_whisper",
+    "vosk_model": "vosk-model-small-ru-0.22"
+}

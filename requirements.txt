@@ -1,0 +1,16 @@
+openai-whisper
+faster-whisper
+vosk
+torch
+torchaudio
+sounddevice
+soundfile
+keyboard
+pyautogui
+pystray
+pillow
+pyperclip
+numpy
+psutil
+comtypes
+pycaw
