@@ -1,76 +1,123 @@
 # Voice Typer
 
-Приложение для преобразования речи в текст с поддержкой CUDA для ускорения обработки.
+A speech-to-text application that converts spoken words into written text automatically. The application runs in the system tray and uses configurable hotkeys to activate voice recording.
 
-## Возможности
+## Features
 
-- 🎤 Запись аудио с микрофона
-- 🚀 Поддержка CUDA для быстрой обработки
-- 🧠 Использование модели Whisper для распознавания речи
-- 💻 Создание исполняемых файлов (.exe)
-- ⚙️ Настройка через конфигурационные файлы
+- **Multiple Speech Recognition Engines**:
+  - OpenAI Whisper
+  - Faster Whisper (optimized version)
+  - Vosk (offline speech recognition)
 
-## Установка
+- **Configurable Settings**:
+  - Customizable hotkey activation
+  - Language selection (auto-detection or specific language)
+  - Model size options (tiny, base, small, medium, large)
+  - Device selection (CPU or GPU with CUDA support)
+  - Excludable phrases that won't be typed
 
-1. Клонируйте репозиторий:
-```bash
-git clone <URL_РЕПОЗИТОРИЯ>
-cd STT
+- **System Tray Interface**:
+  - Visual indicator when recording (RED "REC" icon)
+  - Easy access to settings through the system tray menu
+  - Language indicator in the icon
+
+- **Advanced Features**:
+  - CUDA support for GPU acceleration
+  - Comprehensive logging system
+  - Automatic model downloading
+  - Phrase exclusion filtering
+  - Cross-platform path handling (works as .py or .exe)
+
+## Installation
+
+1. Clone the repository:
+   ```
+   git clone <repository-url>
+   cd voice-typer
+   ```
+
+2. Install required dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. Download speech recognition models (automatically done on first run)
+
+## Usage
+
+1. Run the application:
+   ```
+   python voice_typer.py
+   ```
+
+2. The application will appear in your system tray (look for the language indicator)
+
+3. Press the configured hotkey (default: `Win+Ctrl`) to start recording
+
+4. Speak into your microphone
+
+5. Release the hotkey to stop recording and have the text automatically typed at the cursor position
+
+## Configuration
+
+The application creates a `config.json` file on first run with the following default settings:
+
+```json
+{
+    "hotkey": "win+ctrl",
+    "language": "auto",
+    "model": "large",
+    "model_type": "faster_whisper",
+    "device": "cuda",
+    "force_cpu": false,
+    "vosk_model": "vosk-model-ru-0.42",
+    "exclude_phrases": [
+        "Thank you.",
+        "We'll be right back.",
+        "Thanks for watching!"
+    ]
+}
 ```
 
-2. Создайте виртуальное окружение:
-```bash
-python -m venv venv
-venv\Scripts\activate  # Windows
-```
+You can modify these settings directly in the `config.json` file or through the system tray menu.
 
-3. Установите зависимости:
-```bash
-pip install -r requirements.txt
-```
+## Building Executable
 
-## Использование
+To build a standalone executable:
 
-### Запуск приложения
-```bash
-python voice_typer.py
-```
+1. Install PyInstaller:
+   ```
+   pip install pyinstaller
+   ```
 
-### Создание исполняемого файла
+2. Build the executable:
+   ```
+   pyinstaller voice_typer.spec
+   ```
 
-#### CPU версия:
-```bash
-python build_exe.py
-```
+The executable will be created in the `dist` folder.
 
-#### CUDA версия:
-```bash
-python build_exe_fixed.py
-```
+## Requirements
 
-## Конфигурация
+- Python 3.7+
+- CUDA-compatible GPU (optional, for GPU acceleration)
+- Microphone for voice input
 
-Настройки приложения находятся в файле `config.json`:
-- `model_name`: название модели Whisper
-- `device`: устройство для обработки (cpu/cuda)
-- `language`: язык распознавания
+## Dependencies
 
-## Структура проекта
+- openai-whisper or faster-whisper
+- vosk (for offline speech recognition)
+- sounddevice
+- soundfile
+- pyautogui
+- keyboard
+- pystray
+- pillow
+- torch
+- pyperclip
 
-- `voice_typer.py` - основное приложение
-- `build_exe*.py` - скрипты для создания исполняемых файлов
-- `config.json` - конфигурация приложения
-- `requirements.txt` - зависимости Python
-- `models/` - папка с моделями Whisper
-- `dist/` - собранные исполняемые файлы
+See `requirements.txt` for complete list of dependencies.
 
-## Требования
+## License
 
-- Python 3.8+
-- PyTorch с поддержкой CUDA (опционально)
-- Whisper модели
-- PyAudio для записи звука
-
-## Лицензия
-
-MIT License
+This project is licensed under the MIT License - see the LICENSE file for details.

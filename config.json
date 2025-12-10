@@ -1,10 +1,14 @@
 {
-    "hotkey": "ctrl+shift",
+    "hotkey": "win+ctrl",
     "language": "auto",
-    "model": "medium",
-    "use_faster_whisper": true,
-    "device": "cpu",
-    "force_cpu": false,
+    "model": "large",
     "model_type": "faster_whisper",
-    "vosk_model": "vosk-model-small-ru-0.22"
+    "device": "cuda",
+    "force_cpu": false,
+    "vosk_model": "vosk-model-ru-0.42",
+    "exclude_phrases": [
+        "Thank you.",
+        "We'll be right back.",
+	"Thanks for watching!"
+    ]
 }

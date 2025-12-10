@@ -31,6 +31,7 @@ def get_resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
+
 def get_app_path():
     """Получить путь к папке с приложением (рядом с .exe)"""
     if getattr(sys, 'frozen', False):
@@ -40,16 +41,17 @@ def get_app_path():
         # Если запущено как .py
         return os.path.dirname(os.path.abspath(__file__))
 
+
 # ==== Настройка логирования ====
 def setup_logging():
     """Настройка системы логирования"""
     # Создаем папку для логов если её нет
     log_dir = os.path.join(get_app_path(), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    
+
     # Имя файла лога с датой
     log_file = os.path.join(log_dir, f"voice_typer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    
+
     # Проверяем доступность stdout
     stdout_available = False
     try:
@@ -57,7 +59,7 @@ def setup_logging():
             stdout_available = True
     except:
         pass
-    
+
     # Настройка логирования
     logging.basicConfig(
         level=logging.INFO,
@@ -67,11 +69,13 @@ def setup_logging():
             logging.StreamHandler(sys.stdout) if stdout_available else logging.NullHandler()
         ]
     )
-    
+
     return logging.getLogger(__name__)
+
 
 # Инициализируем логгер
 logger = setup_logging()
+
 
 # Функция для безопасного вывода (работает и с консолью, и без неё)
 def safe_print(message, level="info"):
@@ -84,13 +88,14 @@ def safe_print(message, level="info"):
         logger.error(message)
     elif level == "debug":
         logger.debug(message)
-    
+
     # Также пытаемся вывести в консоль, если она доступна
     try:
         if sys.stdout is not None and hasattr(sys.stdout, 'isatty') and sys.stdout.isatty():
             print(message)
     except:
         pass
+
 
 CONFIG_FILE = get_resource_path("config.json")
 
@@ -102,7 +107,13 @@ default_config = {
     "model_type": "whisper",  # whisper, faster_whisper, vosk
     "device": "cuda",  # "cuda" или "cpu"
     "force_cpu": False,  # принудительно использовать CPU
-    "vosk_model": "vosk-model-ru-0.42"  # модель Vosk по умолчанию
+    "vosk_model": "vosk-model-ru-0.42",  # модель Vosk по умолчанию
+    # Список фраз, при обнаружении которых НЕ нужно вставлять результат распознавания.
+    # Пользователь может редактировать этот список в config.json (вставлять/удалять строки).
+    "exclude_phrases": [
+        "Thank you.",
+        "We'll be right back."
+    ]
 }
 
 # Варианты для выпадающих списков
@@ -125,8 +136,13 @@ running = True  # Флаг работы программы
 
 # Функция для сохранения конфигурации
 def save_config():
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        safe_print("💾 Конфигурация сохранена")
+    except Exception as e:
+        safe_print(f"❌ Ошибка сохранения конфига: {e}", "error")
+
 
 # Функция для загрузки или создания конфигурации
 def load_config():
@@ -138,17 +154,26 @@ def load_config():
     else:
         # Если файл существует, загружаем его
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            try:
+                config = json.load(f)
+            except Exception as e:
+                safe_print(f"❌ Ошибка чтения конфига: {e}. Загружаю дефолт.", "error")
+                config = default_config.copy()
         # Проверяем наличие всех ключей и добавляем отсутствующие
         config_updated = False
         for key, value in default_config.items():
             if key not in config:
                 config[key] = value
                 config_updated = True
+        # Приведение exclude_phrases к списку (если пользователь указал строку)
+        if "exclude_phrases" in config and not isinstance(config["exclude_phrases"], list):
+            config["exclude_phrases"] = [str(config["exclude_phrases"])]
+            config_updated = True
         # Если конфиг был обновлен, сохраняем изменения
         if config_updated:
             save_config()
             safe_print("🔄 Конфигурация обновлена")
+
 
 # ==== Проверка и настройка CUDA ====
 def check_cuda_installation():
@@ -188,19 +213,20 @@ def check_cuda_installation():
         else:
             safe_print(f"❌ Не найдены CUDA DLL по шаблону: {path_pattern}")
 
+
 def setup_cuda():
     safe_print("=== Проверка CUDA ===")
     safe_print(f"ОС: {platform.system()} {platform.version()}")
     safe_print(f"Python версия: {sys.version}")
     safe_print(f"PyTorch версия: {torch.__version__}")
-    
+
     # Проверяем установку CUDA
     check_cuda_installation()
-    
+
     # Проверяем доступность CUDA в PyTorch
     cuda_available = torch.cuda.is_available()
     safe_print(f"CUDA доступна в PyTorch: {cuda_available}")
-    
+
     if cuda_available:
         safe_print(f"CUDA версия: {torch.version.cuda}")
         safe_print(f"Устройство CUDA: {torch.cuda.get_device_name(0)}")
@@ -214,15 +240,18 @@ def setup_cuda():
         except:
             safe_print("Не удалось определить версию cuDNN")
         # Принудительно включаем CUDA
-        torch.cuda.set_device(0)
-        safe_print(f"Текущее устройство CUDA: {torch.cuda.current_device()}")
+        try:
+            torch.cuda.set_device(0)
+            safe_print(f"Текущее устройство CUDA: {torch.cuda.current_device()}")
+        except Exception as e:
+            safe_print(f"⚠️ Ошибка при установке текущего устройства CUDA: {e}")
         return True
     else:
         safe_print("❌ CUDA недоступна в PyTorch. Будет использован CPU.")
         # Дополнительная диагностика
         safe_print("\n=== Дополнительная диагностика ===")
         safe_print(f"Версия PyTorch, собранная с CUDA: {torch.version.cuda}")
-        
+
         # Проверяем, не CPU ли это
         if "+cpu" in torch.__version__:
             safe_print("❌ Установлена CPU-версия PyTorch, а не CUDA-версия!")
@@ -230,12 +259,12 @@ def setup_cuda():
             safe_print("1. pip uninstall torch torchvision torchaudio")
             safe_print("2. pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
             safe_print("\nЕсли это не помогает, попробуйте использовать Python 3.10 или 3.11 вместо 3.13")
-        
+
         # Проверяем версию Python
         if sys.version_info.major == 3 and sys.version_info.minor == 13:
             safe_print("\n⚠️ Вы используете Python 3.13, для которого может не быть сборки PyTorch с CUDA.")
             safe_print("Рекомендуется использовать Python 3.10 или 3.11.")
-        
+
         # Проверяем nvidia-smi
         try:
             import subprocess
@@ -246,8 +275,9 @@ def setup_cuda():
                 safe_print("❌ nvidia-smi не работает - проблема с драйверами")
         except:
             safe_print("❌ nvidia-smi не найден - NVIDIA драйверы не установлены")
-        
+
         return False
+
 
 # ==== Определение устройства ====
 def get_device():
@@ -262,6 +292,7 @@ def get_device():
     else:
         safe_print(f"Используется устройство: CUDA")
         return "cuda"
+
 
 # ==== Загрузка модели ====
 def load_model():
@@ -346,6 +377,7 @@ def load_model():
         safe_print(f"❌ Ошибка загрузки модели: {e}")
         return False
 
+
 # ==== Флаг записи ====
 recording_flag = threading.Event()
 recording_thread = None
@@ -359,15 +391,17 @@ def record_audio(filename="temp.wav", samplerate=16000):
                 while recording_flag.is_set():
                     data, _ = stream.read(1024)
                     file.write(data)
-        safe_print("🛑 Запись остановлена, файл сохранён:", filename)
+        safe_print("🛑 Запись остановлена, файл сохранён: " + filename)
     except Exception as e:
         safe_print(f"❌ Ошибка записи: {e}")
+
 
 # ==== Распознавание + вставка ====
 def transcribe_and_paste(file_path):
     try:
         model_type = config.get("model_type", "whisper")
         lang = None if config["language"] == "auto" else config["language"]
+        text = ""
         if model_type == "whisper":
             result = model.transcribe(file_path, language=lang)
             text = result["text"].strip()
@@ -395,12 +429,34 @@ def transcribe_and_paste(file_path):
                     text = final_result['text']
                 else:
                     text = ""
-        safe_print("📝 Распознано:", text)
+        if not text:
+            safe_print("⚠️ Пустой результат распознавания.")
+            return
+
+        safe_print("📝 Распознано: " + text)
+
+        # Проверка на "исключаемые" фразы (из config)
+        excludes = config.get("exclude_phrases", [])
+        if excludes:
+            lower_text = text.lower()
+            for phrase in excludes:
+                if not phrase:
+                    continue
+                try:
+                    if phrase.lower() in lower_text:
+                        safe_print(f"⚠️ Обнаружена исключаемая фраза '{phrase}'. Вставка НЕ будет выполнена.")
+                        return  # Прекращаем — не вставляем ничего
+                except Exception:
+                    # на всякий случай, если phrase не строка
+                    continue
+
         # вставляем через буфер обмена
         pyperclip.copy(text)
         kb.press_and_release("ctrl+v")
+        safe_print("📋 Текст вставлен в буфер обмена и отправлен (Ctrl+V).")
     except Exception as e:
-        safe_print("❌ Ошибка распознавания:", e)
+        safe_print("❌ Ошибка распознавания: " + str(e), "error")
+
 
 # ==== Управление записью ====
 def start_recording():
@@ -408,9 +464,23 @@ def start_recording():
     safe_print("🎤 Горячая клавиша нажата - начало записи")
     if not recording_flag.is_set():
         recording_flag.set()
+
+        # Обновляем иконку трея на REC (индикация записи)
+        try:
+            if icon:
+                rec_img = create_image("REC", width=64, height=64, color=(200, 0, 0), text_color=(255, 255, 255))
+                icon.icon = rec_img
+                try:
+                    icon.title = "Recording..."
+                except:
+                    pass
+        except Exception as e:
+            safe_print(f"⚠️ Не удалось сменить иконку на REC: {e}")
+
         recording_thread = threading.Thread(target=record_audio, args=("temp.wav",))
         recording_thread.start()
         safe_print("✅ Запись запущена")
+
 
 def stop_recording():
     safe_print("🛑 Горячая клавиша отпущена - остановка записи")
@@ -418,9 +488,23 @@ def stop_recording():
         recording_flag.clear()
         if recording_thread:
             recording_thread.join()
+
+        # Возвращаем иконку трея в состояние языка
+        try:
+            if icon:
+                img = create_image(config.get('language', '??').upper())
+                icon.icon = img
+                try:
+                    icon.title = "Voice Typing"
+                except:
+                    pass
+        except Exception as e:
+            safe_print(f"⚠️ Не удалось вернуть иконку: {e}")
+
         # Запускаем распознавание
         safe_print("🔄 Запуск распознавания...")
         threading.Thread(target=transcribe_and_paste, args=("temp.wav",)).start()
+
 
 # ==== Перенастройка горячих клавиш ====
 def setup_hotkey():
@@ -430,20 +514,28 @@ def setup_hotkey():
         safe_print("🗑️ Удалены старые горячие клавиши")
     except Exception as e:
         safe_print(f"⚠️ Ошибка при удалении горячих клавиш: {e}")
-    
+
     # Устанавливаем новые
     hotkey = config["hotkey"]
     safe_print(f"⌨️ Настройка горячей клавиши: {hotkey}")
-    
+
     try:
+        # add_hotkey будет вызывать start_recording при нажатии, а stop — при отпускании
         keyboard.add_hotkey(hotkey, start_recording, suppress=False, trigger_on_release=False)
-        keyboard.on_release_key(hotkey.split("+")[-1], lambda _: stop_recording())
+        # on_release_key ожидает отдельный аргумент в виде кода клавиши; возьмём последний сегмент
+        last_key = hotkey.split("+")[-1]
+        try:
+            keyboard.on_release_key(last_key, lambda _: stop_recording())
+        except Exception:
+            # fallback: просто используем универсальный отпуск любого клавишного сочетания
+            keyboard.on_release(stop_recording)
         safe_print(f"✅ Горячая клавиша {hotkey} настроена успешно")
     except Exception as e:
         safe_print(f"❌ Ошибка настройки горячей клавиши: {e}")
 
+
 # ==== Функции для изменения настроек ====
-def set_model_type(icon, item):
+def set_model_type(icon_obj, item):
     model_type_map = {
         "Whisper": "whisper",
         "Faster Whisper": "faster_whisper",
@@ -455,7 +547,8 @@ def set_model_type(icon, item):
     load_model()
     update_menu()
 
-def set_device(icon, item):
+
+def set_device(icon_obj, item):
     config["device"] = item.text
     config["force_cpu"] = (item.text == "cpu")
     save_config()
@@ -463,25 +556,29 @@ def set_device(icon, item):
     load_model()
     update_menu()
 
-def set_language(icon, item):
+
+def set_language(icon_obj, item):
     config["language"] = item.text
     save_config()
     safe_print(f"🔄 Язык: {item.text}")
     update_menu()
 
-def set_model(icon, item):
+
+def set_model(icon_obj, item):
     config["model"] = item.text
     save_config()
     safe_print(f"🔄 Модель: {item.text}")
     load_model()
     update_menu()
 
-def set_vosk_model(icon, item):
+
+def set_vosk_model(icon_obj, item):
     config["vosk_model"] = item.text
     save_config()
     safe_print(f"🔄 Модель Vosk: {item.text}")
     load_model()
     update_menu()
+
 
 # ==== Функции для проверки состояния пунктов меню ====
 def check_model_type(option):
@@ -492,17 +589,22 @@ def check_model_type(option):
     }
     return lambda _: model_type_map[option] == config.get("model_type", "whisper")
 
+
 def check_device(option):
     return lambda _: option == config["device"]
+
 
 def check_language(option):
     return lambda _: option == config["language"]
 
+
 def check_model(option):
     return lambda _: option == config["model"]
 
+
 def check_vosk_model(option):
     return lambda _: option == config.get("vosk_model", "vosk-model-ru-0.42")
+
 
 # ==== Функции для меню трея ====
 def create_image(text, width=64, height=64, color=(0, 128, 0), text_color=(255, 255, 255)):
@@ -524,11 +626,13 @@ def create_image(text, width=64, height=64, color=(0, 128, 0), text_color=(255, 
     draw.text(position, text, fill=text_color, font=font)
     return image
 
-def on_quit(icon, item):
+
+def on_quit(icon_obj, item):
     global running
     running = False
-    icon.stop()
+    icon_obj.stop()
     os._exit(0)
+
 
 def update_menu():
     global icon
@@ -596,8 +700,12 @@ def update_menu():
             ]
         menu = pystray.Menu(*menu_items)
         icon.menu = menu
-        # Обновляем иконку с текущим языком
-        icon.icon = create_image(config['language'].upper())
+        # Обновляем иконку с текущим языком (если не в записи)
+        try:
+            icon.icon = create_image(config['language'].upper())
+        except:
+            pass
+
 
 def run_tray():
     global icon
@@ -668,31 +776,32 @@ def run_tray():
     icon = pystray.Icon("Voice Typing", icon_image, "Voice Typing", menu)
     icon.run()
 
+
 # ==== Основная программа ====
 if __name__ == "__main__":
     try:
         safe_print("🚀 Запуск Voice Typer...")
-        
-        # Проверяем и настраиваем CUDA
-        setup_cuda()
-        
+
         # Загружаем конфигурацию
         load_config()
-        
+
+        # Проверяем и настраиваем CUDA (в load_model и get_device используется config)
+        setup_cuda()
+
         # Загружаем модель
         if not load_model():
             safe_print("❌ Не удалось загрузить модель. Завершение работы.")
             os._exit(1)
-        
+
         # Настраиваем горячие клавиши в основном потоке
         safe_print("⌨️ Настройка горячих клавиш...")
         setup_hotkey()
-        
+
         safe_print("✅ Приложение запущено успешно. Иконка в трее активна.")
-        
+
         # Запускаем трей в основном потоке (блокирующий вызов)
         run_tray()
-            
+
     except Exception as e:
         safe_print(f"❌ Критическая ошибка: {e}", "error")
         # Создаем файл с ошибкой для диагностики
