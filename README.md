@@ -49,6 +49,11 @@ A speech-to-text application that converts spoken words into written text automa
    ```
    python voice_typer.py
    ```
+   
+   Or run the compiled executable:
+   ```
+   ./dist/voice_typer.exe
+   ```
 
 2. The application will appear in your system tray (look for the language indicator)
 
@@ -96,6 +101,21 @@ To build a standalone executable:
    ```
 
 The executable will be created in the `dist` folder.
+
+## Troubleshooting
+
+### DLL Loading Issues
+
+If you encounter DLL loading errors (like "OSError: [WinError 1114] Произошел сбой в программе инициализации библиотеки динамической компоновки (DLL)"), this is typically caused by missing or incompatible Torch library dependencies.
+
+The updated `voice_typer.spec` file in this repository includes proper handling of Torch dependencies to prevent these issues.
+
+### CUDA Setup
+
+For GPU acceleration with CUDA:
+1. Ensure you have compatible NVIDIA drivers installed
+2. Install CUDA toolkit compatible with your PyTorch version
+3. Make sure your GPU is supported by the Torch CUDA version
 
 ## Requirements
 
