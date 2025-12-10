@@ -108,7 +108,11 @@ The executable will be created in the `dist` folder.
 
 If you encounter DLL loading errors (like "OSError: [WinError 1114] Произошел сбой в программе инициализации библиотеки динамической компоновки (DLL)"), this is typically caused by missing or incompatible Torch library dependencies.
 
-The updated `voice_typer.spec` file in this repository includes proper handling of Torch dependencies to prevent these issues.
+**Solution**: The updated `voice_typer.spec` file and custom Torch hook in this repository properly handle Torch dependencies. The build process now includes:
+
+1. Custom Torch hook that ensures all necessary DLLs are included
+2. Proper collection of Torch binaries and data files
+3. Explicit inclusion of the problematic `c10.dll` and other critical libraries
 
 ### CUDA Setup
 
