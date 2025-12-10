@@ -175,3 +175,7 @@ Thumbs.db
 temp.wav
 *.wav
 config.json
+
+# ML Models (should be downloaded when needed)
+models/
+vosk_models/
