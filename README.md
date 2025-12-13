@@ -102,28 +102,8 @@ To build a standalone executable:
 
 The executable will be created in the `dist` folder.
 
-## Troubleshooting
-
-### DLL Loading Issues
-
-If you encounter DLL loading errors (like "OSError: [WinError 1114] Произошел сбой в программе инициализации библиотеки динамической компоновки (DLL)"), this is typically caused by missing or incompatible Torch library dependencies.
-
-**Solution**: The updated `voice_typer.spec` file and custom Torch hook in this repository properly handle Torch dependencies. The build process now includes:
-
-1. Custom Torch hook that ensures all necessary DLLs are included
-2. Proper collection of Torch binaries and data files
-3. Explicit inclusion of the problematic `c10.dll` and other critical libraries
-
-### CUDA Setup
-
-For GPU acceleration with CUDA:
-1. Ensure you have compatible NVIDIA drivers installed
-2. Install CUDA toolkit compatible with your PyTorch version
-3. Make sure your GPU is supported by the Torch CUDA version
-
 ## Requirements
 
-- Python 3.7+
 - CUDA-compatible GPU (optional, for GPU acceleration)
 - Microphone for voice input
 

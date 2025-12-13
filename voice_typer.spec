@@ -1,62 +1,75 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import torch
-import os
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+block_cipher = None
+
+datas = []
+binaries = []
+hiddenimports = []
+
+# --- torch ---
+torch_datas, torch_bins, torch_hidden = collect_all('torch')
+datas += torch_datas
+binaries += torch_bins
+hiddenimports += torch_hidden
+
+# --- whisper ---
+w_datas, w_bins, w_hidden = collect_all('whisper')
+datas += w_datas
+binaries += w_bins
+hiddenimports += w_hidden
+
+# --- faster whisper ---
+hiddenimports += collect_submodules('faster_whisper')
+
+# --- vosk ---
+v_datas, v_bins, v_hidden = collect_all('vosk')
+datas += v_datas
+binaries += v_bins
+hiddenimports += v_hidden
+
+# --- audio ---
+hiddenimports += ['sounddevice', 'soundfile', 'numpy', 'scipy']
+
+# --- tray / images ---
+hiddenimports += collect_submodules('pystray')
+hiddenimports += collect_submodules('PIL')
+
+# --- input ---
+hiddenimports += ['keyboard', 'pyperclip', 'pyautogui']
+
+# --- CUDA ---
+hiddenimports += ['torch.cuda', 'torch.backends.cudnn']
 
 a = Analysis(
     ['voice_typer.py'],
-    pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=[
-        'whisper',
-        'faster_whisper',
-        'vosk',
-        'sounddevice',
-        'soundfile',
-        'pyautogui',
-        'keyboard',
-        'pystray',
-        'PIL',
-        'torch',
-        'pyperclip',
-        'numpy',
-        'scipy'
+    binaries=binaries,
+    datas=datas + [
+        ('config.json', '.'),
     ],
-    hookspath=['./hooks'],  # Use our custom hooks
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    noarchive=False,
-    optimize=0,
+    hiddenimports=hiddenimports,
+    excludes=['tkinter', 'matplotlib'],
+    noarchive=False
 )
-pyz = PYZ(a.pure)
+
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
     a.scripts,
-    [],
     exclude_binaries=True,
-    name='voice_typer',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
+    name='VoiceTyper',
     console=False,
-    icon='C:\\PY\\STT\\icon.ico',
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    icon=r'C:\PY\STT\icon.ico'
 )
+
 coll = COLLECT(
     exe,
     a.binaries,
+    a.zipfiles,
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    name='voice_typer',
+    name='VoiceTyper'
 )
