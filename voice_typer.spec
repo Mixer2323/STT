@@ -1,75 +1,146 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+import glob
+import os
+import sysconfig
 
-block_cipher = None
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 datas = []
 binaries = []
 hiddenimports = []
 
-# --- torch ---
-torch_datas, torch_bins, torch_hidden = collect_all('torch')
-datas += torch_datas
-binaries += torch_bins
-hiddenimports += torch_hidden
+if os.path.exists("icon.ico"):
+    datas.append(("icon.ico", "."))
 
-# --- whisper ---
-w_datas, w_bins, w_hidden = collect_all('whisper')
-datas += w_datas
-binaries += w_bins
-hiddenimports += w_hidden
+# Engines are resolved through importlib, so PyInstaller cannot see them.
+hiddenimports += collect_submodules("voicetyper")
 
-# --- faster whisper ---
-hiddenimports += collect_submodules('faster_whisper')
+# GigaAM (uniffi bindings plus the native DLL).
+for collector in (collect_data_files, collect_dynamic_libs, collect_submodules):
+    try:
+        collected = collector("gigastt_uniffi")
+        if collector is collect_data_files:
+            datas += collected
+        elif collector is collect_dynamic_libs:
+            binaries += collected
+        else:
+            hiddenimports += collected
+    except Exception:
+        pass
 
-# --- vosk ---
-v_datas, v_bins, v_hidden = collect_all('vosk')
-datas += v_datas
-binaries += v_bins
-hiddenimports += v_hidden
+# Python modules with lazy imports or plugin discovery. ONNX Runtime is added
+# as a hidden import only: its tools/transformers subpackages pull in numba,
+# llvmlite and other dev-only dependencies (~100 MB) that are never used here.
+for package in (
+    "faster_whisper",
+    "ctranslate2",
+    "tokenizers",
+    "huggingface_hub",
+    "pystray",
+    "PIL",
+    "pyctcdecode",
+):
+    try:
+        hiddenimports += collect_submodules(package)
+    except Exception:
+        pass
 
-# --- audio ---
-hiddenimports += ['sounddevice', 'soundfile', 'numpy', 'scipy']
+hiddenimports += [
+    "tone",
+    "av",
+    "kenlm",
+    "keyboard",
+    "pyperclip",
+    "psutil",
+    "sounddevice",
+    "soundfile",
+    "numpy",
+    "onnxruntime",
+]
 
-# --- tray / images ---
-hiddenimports += collect_submodules('pystray')
-hiddenimports += collect_submodules('PIL')
+for package in ("ctranslate2", "tokenizers", "av", "onnxruntime.capi", "PIL"):
+    try:
+        binaries += collect_dynamic_libs(package)
+    except Exception:
+        pass
 
-# --- input ---
-hiddenimports += ['keyboard', 'pyperclip', 'pyautogui']
+for package in ("ctranslate2", "av", "onnxruntime", "pyctcdecode", "PIL"):
+    try:
+        datas += collect_data_files(package)
+    except Exception:
+        pass
 
-# --- CUDA ---
-hiddenimports += ['torch.cuda', 'torch.backends.cudnn']
+# sounddevice / soundfile keep their native libraries in sibling packages.
+for package in ("_sounddevice_data", "_soundfile_data"):
+    try:
+        datas += collect_data_files(package)
+        hiddenimports += [package]
+    except Exception:
+        pass
+
+# kenlm is a top-level extension module with a companion DLL.
+site_packages = sysconfig.get_paths()["purelib"]
+for pattern in ("kenlm*.pyd", "kenlm*.dll"):
+    for path in glob.glob(os.path.join(site_packages, pattern)):
+        binaries.append((path, "."))
 
 a = Analysis(
-    ['voice_typer.py'],
+    ["voice_typer.py"],
+    pathex=[],
     binaries=binaries,
-    datas=datas + [
-        ('config.json', '.'),
-    ],
+    datas=datas,
     hiddenimports=hiddenimports,
-    excludes=['tkinter', 'matplotlib'],
-    noarchive=False
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "torch",
+        "torchaudio",
+        "torchvision",
+        "transformers",
+        "matplotlib",
+        "whisper",
+        "vosk",
+        "sklearn",
+        "pandas",
+        "numba",
+        "llvmlite",
+        "onnxruntime.tools",
+        "onnxruntime.transformers",
+        "onnxruntime.quantization",
+        "onnxruntime.training",
+        "IPython",
+        "pytest",
+        "hypothesis",
+    ],
+    noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
-    name='VoiceTyper',
+    name="VoiceTyper",
+    debug=False,
+    strip=False,
+    upx=False,
     console=False,
-    icon=r'C:\PY\STT\icon.ico'
+    icon="icon.ico",
+    version="version_info.txt",
 )
 
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    name='VoiceTyper'
+    upx=False,
+    name="VoiceTyper",
 )

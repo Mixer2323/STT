@@ -1,11 +1,22 @@
-openai-whisper
-faster-whisper
-vosk
-sounddevice
-soundfile
-pyautogui
-keyboard
-pystray
-pillow
-torch
-pyperclip
+# Runtime dependencies for Voice Typer.
+# PyInstaller, pytest and linters live in requirements-dev.txt.
+
+faster-whisper==1.2.0
+huggingface-hub>=0.34,<1
+sounddevice==0.5.2
+soundfile==0.13.1
+keyboard==0.13.5
+pyperclip==1.9.0
+pystray==0.19.5
+pillow>=11
+numpy>=1.26,<2
+onnxruntime>=1.17,<2
+psutil>=5.9
+
+# GigaAM v3 (Russian STT, ONNX models are downloaded on first use)
+gigastt==2.22.0
+
+# T-one (streaming Russian ASR, installed from GitHub)
+tone @ git+https://github.com/voicekit-team/T-one.git
+kenlm>=0.3,<1
+pyctcdecode>=0.2,<1

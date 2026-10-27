@@ -1,0 +1,11 @@
+-r requirements.txt
+
+# Development and packaging
+pytest>=8
+pytest-cov>=5
+pyinstaller==6.15.0
+ruff>=0.6
+
+# Optional: higher-quality resampling (the app falls back to a linear
+# resampler when soxr is not installed).
+soxr>=0.3.7

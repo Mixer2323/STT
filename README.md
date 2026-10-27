@@ -1,127 +1,268 @@
 # Voice Typer
 
-A speech-to-text application that converts spoken words into written text automatically. The application runs in the system tray and uses configurable hotkeys to activate voice recording.
+Локальное распознавание речи для Windows: приложение живёт в системном трее,
+записывает микрофон по горячей клавише, распознаёт текст и вставляет его в
+активное окно. Аудио и текст не покидают компьютер.
 
-## Features
+## Возможности
 
-- **Multiple Speech Recognition Engines**:
-  - OpenAI Whisper
-  - Faster Whisper (optimized version)
-  - Vosk (offline speech recognition)
+- **Три движка**
+  - **GigaAM v3** — русский язык, on-device ONNX, хорошее качество при
+    умеренном размере модели;
+  - **T-one** — русский язык, потоковое CTC-распознавание, низкие требования
+    к памяти, опциональный KenLM-декодер;
+  - **Faster-Whisper** — многоязычный, выбор модели от `tiny` до `large-v3`.
+- **Автовыбор движка и устройства** по языку, объёму RAM/VRAM и свободному
+  месту на диске; выбор можно переопределить в трее.
+- **Фоновая загрузка модели**: трей доступен сразу, переключения движка
+  ставятся в очередь и не теряются.
+- **Потоковый предпросмотр** для T-one: распознанный текст показывается в
+  подсказке трея прямо во время записи.
+- **Два режима горячей клавиши**: удержание (по умолчанию) и переключение
+  старт/стоп.
+- **Три способа вставки**: `Ctrl+V` с восстановлением буфера обмена, только
+  буфер обмена или эмуляция набора текста.
+- **Возврат фокуса** в окно, активное в момент начала записи.
+- **История** в локальной SQLite: поиск, копирование, удаление, экспорт CSV.
+- **Постобработка**: обрезка тишины, заглавные буквы, слова-заполнители,
+  фразы-исключения для типичных галлюцинаций моделей.
+- **Автозапуск**, защита от второго экземпляра, портативный режим.
+- **Диагностика** одной командой и логи с ротацией; полный текст распознавания
+  в логи по умолчанию не пишется.
 
-- **Configurable Settings**:
-  - Customizable hotkey activation
-  - Language selection (auto-detection or specific language)
-  - Model size options (tiny, base, small, medium, large)
-  - Device selection (CPU or GPU with CUDA support)
-  - Excludable phrases that won't be typed
+## Архитектура
 
-- **System Tray Interface**:
-  - Visual indicator when recording (RED "REC" icon)
-  - Easy access to settings through the system tray menu
-  - Language indicator in the icon
-
-- **Advanced Features**:
-  - CUDA support for GPU acceleration
-  - Comprehensive logging system
-  - Automatic model downloading
-  - Phrase exclusion filtering
-  - Cross-platform path handling (works as .py or .exe)
-
-## Installation
-
-1. Clone the repository:
-   ```
-   git clone <repository-url>
-   cd voice-typer
-   ```
-
-2. Install required dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-3. Download speech recognition models (automatically done on first run)
-
-## Usage
-
-1. Run the application:
-   ```
-   python voice_typer.py
-   ```
-   
-   Or run the compiled executable:
-   ```
-   ./dist/voice_typer.exe
-   ```
-
-2. The application will appear in your system tray (look for the language indicator)
-
-3. Press the configured hotkey (default: `Win+Ctrl`) to start recording
-
-4. Speak into your microphone
-
-5. Release the hotkey to stop recording and have the text automatically typed at the cursor position
-
-## Configuration
-
-The application creates a `config.json` file on first run with the following default settings:
-
-```json
-{
-    "hotkey": "win+ctrl",
-    "language": "auto",
-    "model": "large",
-    "model_type": "faster_whisper",
-    "device": "cuda",
-    "force_cpu": false,
-    "vosk_model": "vosk-model-ru-0.42",
-    "exclude_phrases": [
-        "Thank you.",
-        "We'll be right back.",
-        "Thanks for watching!"
-    ]
-}
+```
+voice_typer.py / python -m voicetyper
+└── voicetyper/
+    ├── app.py            жизненный цикл, состояние записи, действия пользователя
+    ├── audio.py          PortAudio-захват, VAD, ресемплинг, WAV
+    ├── pipeline.py       очередь распознавания и вставки
+    ├── models.py         фоновая загрузка, lease-модель, безопасная смена движка
+    ├── engines/          gigaam.py, tone.py, whisper.py, registry.py
+    ├── postprocess.py    очистка текста и фразы-исключения
+    ├── insertion.py      Win32 SendInput, буфер обмена, фокус окна
+    ├── history.py        SQLite-история
+    ├── tray.py           иконка, меню, статусы, прогресс
+    ├── settings_ui.py    окно настроек и история на Tkinter
+    ├── hotkeys.py        глобальные горячие клавиши
+    ├── config.py         типизированный конфиг, валидация, миграция
+    ├── paths.py          расположение данных, портативный режим
+    ├── downloads.py      загрузки с прогрессом, checksum, отменой
+    ├── model_packs.py    готовые архивы моделей из GitHub Releases
+    ├── hardware.py       RAM/VRAM/диск и выбор движка
+    ├── diagnostics.py    отчёт без содержимого расшифровок
+    ├── logging_setup.py  ротация логов, crash-дампы, редакция текста
+    ├── autostart.py      автозапуск через HKCU
+    └── single_instance.py именованный mutex и активация окна
 ```
 
-You can modify these settings directly in the `config.json` file or through the system tray menu.
+Захват звука не выполняет инференс в аудиоколбэке: блоки складываются в
+очередь, предпросмотр и распознавание работают в отдельных потоках. Модель
+выдаётся через lease, поэтому смена движка не выгружает её из-под активной
+записи.
 
-## Building Executable
+## Требования
 
-To build a standalone executable:
+- Windows 10/11 x64;
+- Python 3.10+ для запуска из исходников;
+- микрофон;
+- опционально NVIDIA GPU. Faster-Whisper использует CUDA при наличии
+  CUDA-библиотек, иначе автоматически переходит на CPU.
 
-1. Install PyInstaller:
-   ```
-   pip install pyinstaller
-   ```
+## Установка и запуск
 
-2. Build the executable:
-   ```
-   pyinstaller voice_typer.spec
-   ```
+```powershell
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python -m voicetyper
+```
 
-The executable will be created in the `dist` folder.
+`tone` устанавливается из GitHub (`voicekit-team/T-one`), `gigastt` — из PyPI.
+Модели скачиваются при первом использовании. Прогресс виден в меню трея.
+Быстрее — скачать готовые архивы из [релиза моделей](https://github.com/mixer232323-web/STT/releases/tag/models-v1)
+и распаковать их в папку моделей (см. раздел «Готовые пакеты моделей»).
 
-## Requirements
+После запуска дождитесь статуса «Готово», поставьте курсор в нужное окно и
+используйте горячую клавишу (по умолчанию `Ctrl+Alt+Space`):
 
-- CUDA-compatible GPU (optional, for GPU acceleration)
-- Microphone for voice input
+- **удержание** — запись идёт, пока клавиши нажаты;
+- **переключение** — первое нажатие начинает запись, второе останавливает.
 
-## Dependencies
+В настройках сочетание можно не вводить вручную: нажмите «Записать…» и
+удерживайте нужные клавиши — комбинация подставится в поле, `Esc` отменяет
+запись. Захватывается физическая клавиша, поэтому `Alt+X` остаётся `Alt+X`
+при любой раскладке. Одних модификаторов (например `Ctrl+Alt`) недостаточно —
+нужна обычная клавиша; одиночная обычная клавиша тоже не подойдёт, иначе она
+перехватывалась бы во всех приложениях (исключение — `F1`–`F24`).
 
-- openai-whisper or faster-whisper
-- vosk (for offline speech recognition)
-- sounddevice
-- soundfile
-- pyautogui
-- keyboard
-- pystray
-- pillow
-- torch
-- pyperclip
+Настройки открываются из трея или командой `python -m voicetyper --settings`.
+Левый клик по значку открывает настройки, а во время записи — останавливает её;
+остальные действия доступны в меню по правому клику.
 
-See `requirements.txt` for complete list of dependencies.
+## Где хранятся данные
 
-## License
+По умолчанию состояние находится в `%LOCALAPPDATA%\VoiceTyper`:
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+| Путь | Назначение |
+| --- | --- |
+| `config.json` | настройки |
+| `history.db` | история распознавания (SQLite) |
+| `logs\voice_typer.log` | логи, ротация 2 МБ × 5 |
+| `diagnostics\` | сохранённые отчёты диагностики |
+| `tmp\` | временные WAV-файлы |
+| `models\` | модели, если рядом с программой нет папки `models` |
+
+Старые установки продолжают использовать `models\` рядом с `.exe`. Прежний
+`config.json` рядом с программой импортируется в `%LOCALAPPDATA%` при первом
+запуске; исходный файл не удаляется.
+
+**Портативный режим**: создайте пустой файл `portable.txt` рядом с
+`VoiceTyper.exe`. Состояние будет храниться в `data\`, модели — в
+`data\models\` (или в существующей папке `models\` рядом с `.exe`).
+
+Переопределить каталоги можно переменными окружения `VOICETYPER_DATA_DIR` и
+`VOICETYPER_MODELS_DIR`. Если модели уже скачаны в другое место, проще указать
+`VOICETYPER_MODELS_DIR` (например, на общую папку `models\`), чем скачивать их
+повторно.
+
+### Готовые пакеты моделей (рекомендуется)
+
+Самый быстрый способ установки — скачать архивы со страницы
+[релиза моделей](https://github.com/mixer232323-web/STT/releases/tag/models-v1).
+Каждый архив распаковывается в свою подпапку каталога моделей (`models\` рядом
+с программой, `%LOCALAPPDATA%\VoiceTyper\models\` или `data\models\` в
+портативном режиме):
+
+| Архив | Куда распаковать | Размер |
+| --- | --- | --- |
+| `VoiceTyper-models-gigastt-v3.zip` | `gigastt\` | 327 МБ |
+| `VoiceTyper-models-tone-model.zip` | `tone\` | 144 МБ |
+| `VoiceTyper-models-whisper-large-v3-turbo.zip` | `faster_whisper\mobiuslabsgmbh--faster-whisper-large-v3-turbo\` | 1,62 ГБ |
+
+Файлы из архива должны лежать прямо в указанной папке. При первом запуске
+движка приложение сначала пытается скачать соответствующий архив с GitHub и
+только при ошибке переходит к пофайловой загрузке из Hugging Face.
+
+Архив T-one содержит только `model.onnx`. Для декодера `beam_search` нужен
+`kenlm.bin` (около 5,3 ГБ), он скачивается с Hugging Face отдельно; при
+недоступности приложение автоматически использует `greedy`.
+
+Резервные источники, если GitHub недоступен:
+
+- GigaAM v3 — [Hugging Face](https://huggingface.co/istupakov/gigaam-v3-onnx),
+  [GitHub Releases](https://github.com/ekhodzitsky/gigastt/releases/tag/models-v3-2026-10-09);
+- T-one — [Hugging Face](https://huggingface.co/t-tech/T-one);
+- Faster-Whisper large-v3-turbo —
+  [Hugging Face](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo).
+
+### Источники моделей
+
+GigaAM v3 скачивается с Hugging Face (`istupakov/gigaam-v3-onnx`) — тот же
+экспорт, что и в GitHub-релизе, но CDN обычно в десятки раз быстрее. Если
+зеркало недоступно, загрузка автоматически повторяется с GitHub Releases.
+Частичные файлы у каждого источника свои, поэтому переключение между ними не
+портит докачку. Для собственного зеркала задайте
+`VOICETYPER_GIGASTT_MIRROR` — базовый URL, откуда четыре файла GigaAM доступны
+под своими именами.
+
+T-one и Faster-Whisper скачиваются с Hugging Face.
+
+## Настройки
+
+Все параметры доступны в окне настроек; `config.json` можно править вручную
+при закрытом приложении. Основные поля:
+
+| Поле | Значения | По умолчанию |
+| --- | --- | --- |
+| `hotkey` | сочетание клавиш | `ctrl+alt+space` |
+| `hotkey_mode` | `hold`, `toggle` | `hold` |
+| `language` | `auto`, `ru`, `en`, … | `auto` |
+| `model_type` | `auto`, `gigaam`, `faster_whisper`, `tone` | `auto` |
+| `whisper_model` | `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` | `large-v3-turbo` |
+| `tone_decoder` | `auto`, `beam_search`, `greedy` | `auto` |
+| `device` | `auto`, `cpu`, `cuda` | `auto` |
+| `compute_type` | `auto`, `int8`, `float16`, `int8_float16` | `auto` |
+| `input_device` | индекс или имя микрофона | системный |
+| `max_recording_seconds` | 10–3600 | `300` |
+| `insert_mode` | `paste`, `clipboard`, `type` | `paste` |
+| `restore_clipboard` | `true`/`false` | `true` |
+| `restore_target_window` | `true`/`false` | `true` |
+| `paste_delay_ms` | 0–2000 | `80` |
+| `trim_silence` | `true`/`false` | `true` |
+| `capitalize` | `true`/`false` | `true` |
+| `remove_fillers` | `true`/`false` | `false` |
+| `exclude_phrases` | список строк | типовые галлюцинации |
+| `history_enabled` | `true`/`false` | `true` |
+| `history_limit` | 0–10000 | `200` |
+| `log_transcripts` | `true`/`false` | `false` |
+| `notifications` | `true`/`false` | `true` |
+| `streaming_preview` | `true`/`false` | `true` |
+| `autostart` | `true`/`false` | `false` |
+| `single_instance` | `true`/`false` | `true` |
+
+`exclude_phrases` отменяет вставку, только если распознанный текст состоит из
+этой фразы (возможно, повторённой). Фраза внутри длинной диктовки ничего не
+отменяет.
+
+## Командная строка
+
+```text
+VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--verbose] [--version]
+```
+
+- `--settings` — открыть настройки при запуске;
+- `--minimized` — не открывать настройки при первом запуске;
+- `--diagnostics` — напечатать отчёт и сохранить его в `diagnostics\`, не
+  запуская приложение;
+- `--verbose` — подробные логи;
+- `--version` — версия.
+
+## Сборка
+
+```powershell
+pip install -r requirements-dev.txt
+python -m PyInstaller --noconfirm voice_typer.spec
+```
+
+Результат — `dist\VoiceTyper\VoiceTyper.exe` вместе с `_internal`. Сборка
+однопапочная, без `torch`: CUDA-детект использует `nvidia-smi` и CTranslate2,
+а ONNX-движки работают через ONNX Runtime. Иконка и версия `.exe` задаются
+`icon.ico` и `version_info.txt`.
+
+## Тесты и линтер
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+ruff check .
+```
+
+Тесты не требуют микрофона, GPU и скачанных моделей. CI (GitHub Actions)
+запускает линтер и тесты на Python 3.10 и 3.12.
+
+## Приватность
+
+- Приложение не отправляет телеметрию и работает офлайн после загрузки модели.
+- Сеть используется только для скачивания моделей (Hugging Face и GitHub
+  Releases как резервный источник).
+- История хранится локально; её можно отключить, очистить или ограничить.
+- В логах по умолчанию нет текста распознавания — только длина и SHA-256
+  фрагмент. Полный текст включается параметром `log_transcripts`.
+- Диагностика содержит сведения о системе, движках и размерах каталогов, но не
+  текст расшифровок.
+
+## Диагностика проблем
+
+1. Запустите `VoiceTyper.exe --diagnostics` — отчёт появится в
+   `%LOCALAPPDATA%\VoiceTyper\diagnostics\`.
+2. Проверьте `%LOCALAPPDATA%\VoiceTyper\logs\voice_typer.log`.
+3. Если текст не вставляется, попробуйте режим `clipboard` или `type` в
+   настройках: некоторые приложения (в том числе запущенные от администратора)
+   блокируют `Ctrl+V` из фонового процесса.
+4. Если модель не загрузилась, в трее отображается ошибка; после устранения
+   причины выберите «Перезагрузить модель» в меню.
+5. Если значка не видно, он может быть скрыт Windows в переполнении трея:
+   нажмите `^` на панели задач и перетащите значок на панель. Приложение при
+   каждом запуске показывает уведомление, что работает в фоне.

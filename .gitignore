@@ -50,6 +50,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.pytest_tmp/
+.ruff_cache/
 cover/
 
 # Translations
@@ -180,3 +182,9 @@ config.json
 # ML Models (should be downloaded when needed)
 models/
 vosk_models/
+
+# Local build/run artifacts
+build_log.txt
+archive/
+diagnostics*.txt
+release_assets/
