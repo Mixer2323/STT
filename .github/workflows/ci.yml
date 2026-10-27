@@ -38,6 +38,6 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pytest-cov numpy soundfile
+          python -m pip install pytest pytest-cov numpy soundfile keyboard pystray pillow pyperclip
       - name: Run tests
         run: python -m pytest -q --cov=voicetyper --cov-report=term-missing
