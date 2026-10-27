@@ -25,6 +25,7 @@ from .constants import (
     ENGINE_LABELS,
     ENGINE_ORDER,
     LANGUAGES,
+    MULTILINGUAL_ENGINES,
     TONE_DECODERS,
     WHISPER_MODELS,
 )
@@ -387,7 +388,7 @@ class SettingsWindow:
         engine_box.columnconfigure(1, weight=1)
 
         self.vars["language"] = tk.StringVar()
-        self._combo_row(
+        self.language_combo = self._combo_row(
             engine_box,
             0,
             "Язык",
@@ -405,7 +406,10 @@ class SettingsWindow:
             self._engine_labels.append(label)
             self._engine_values.append(code)
         self.vars["model_type"] = tk.StringVar()
-        self._combo_row(engine_box, 1, "Движок", self.vars["model_type"], self._engine_labels)
+        self.engine_combo = self._combo_row(
+            engine_box, 1, "Движок", self.vars["model_type"], self._engine_labels
+        )
+        self.engine_combo.bind("<<ComboboxSelected>>", self._on_engine_selected)
 
         self.vars["whisper_model"] = tk.StringVar()
         self._combo_row(engine_box, 2, "Модель Whisper", self.vars["whisper_model"], list(WHISPER_MODELS))
@@ -443,8 +447,13 @@ class SettingsWindow:
         ).grid(row=7, column=1, sticky="w", pady=2)
         ttk.Label(
             engine_box,
-            text="«Авто» выбирает GigaAM/T-one для русского и Whisper для остальных языков.",
+            text=(
+                "«Авто» выбирает GigaAM/T-one для русского. GigaAM и T-one "
+                "распознают только русский, поэтому выбор языка доступен лишь "
+                "для Faster-Whisper."
+            ),
             style="Hint.TLabel",
+            wraplength=int(480 * self._scale),
         ).grid(row=8, column=1, sticky="w", pady=(4, 0))
 
         self._register_dirty_traces()
@@ -739,6 +748,24 @@ class SettingsWindow:
         self._row(parent, row, label, combo)
         return combo
 
+    def _engine_code(self) -> str:
+        return dict(zip(self._engine_labels, self._engine_values, strict=True)).get(
+            self.vars["model_type"].get(), self._store.get().model_type
+        )
+
+    def _update_language_options(self) -> None:
+        if self._engine_code() in MULTILINGUAL_ENGINES:
+            self.language_combo.configure(
+                values=[_LANG_LABELS[code] for code in LANGUAGES], state="readonly"
+            )
+        else:
+            self.language_combo.configure(values=["Русский"], state="disabled")
+            if self.vars["language"].get() != "Русский":
+                self.vars["language"].set("Русский")
+
+    def _on_engine_selected(self, _event=None) -> None:
+        self._update_language_options()
+
     def _spin_row(self, parent, row: int, label: str, variable, minimum: int, maximum: int):
         spin = ttk.Spinbox(parent, from_=minimum, to=maximum, textvariable=variable, width=10)
         spin.bind("<MouseWheel>", self._on_form_wheel)
@@ -783,6 +810,7 @@ class SettingsWindow:
                     cfg.model_type, ENGINE_LABELS.get(cfg.model_type, cfg.model_type)
                 )
             )
+            self._update_language_options()
             self.vars["whisper_model"].set(cfg.whisper_model)
             self.vars["tone_decoder"].set(_TONE_LABELS.get(cfg.tone_decoder, cfg.tone_decoder))
             self.vars["device"].set(_DEVICE_LABELS.get(cfg.device, cfg.device))
@@ -1064,9 +1092,13 @@ class SettingsWindow:
         try:
             hotkey, _keys = normalize_hotkey(self.vars["hotkey"].get())
             base = self._store.get()
-            language = _reverse(_LANG_LABELS).get(self.vars["language"].get(), base.language)
             engine = dict(zip(self._engine_labels, self._engine_values, strict=True)).get(
                 self.vars["model_type"].get(), base.model_type
+            )
+            language = (
+                _reverse(_LANG_LABELS).get(self.vars["language"].get(), "ru")
+                if engine in MULTILINGUAL_ENGINES
+                else "ru"
             )
             tone = _reverse(_TONE_LABELS).get(self.vars["tone_decoder"].get(), base.tone_decoder)
             device = _reverse(_DEVICE_LABELS).get(self.vars["device"].get(), base.device)

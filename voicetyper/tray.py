@@ -14,6 +14,7 @@ from .constants import (
     ENGINE_LABELS,
     ENGINE_ORDER,
     LANGUAGES,
+    MULTILINGUAL_ENGINES,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_LOADING,
@@ -285,14 +286,24 @@ class TrayController:
                 )
             )
 
-        language_items = [
-            pystray.MenuItem(
-                _LANGUAGE_LABELS.get(code, code),
-                self._action(self._app.set_language, code),
-                checked=self._checked("language", code),
-            )
-            for code in LANGUAGES
-        ]
+        if cfg.model_type in MULTILINGUAL_ENGINES:
+            language_items = [
+                pystray.MenuItem(
+                    _LANGUAGE_LABELS.get(code, code),
+                    self._action(self._app.set_language, code),
+                    checked=self._checked("language", code),
+                )
+                for code in LANGUAGES
+            ]
+        else:
+            language_items = [
+                pystray.MenuItem(
+                    "Русский (только для этого движка)",
+                    None,
+                    checked=lambda _item: True,
+                    enabled=False,
+                )
+            ]
 
         whisper_items = [
             pystray.MenuItem(

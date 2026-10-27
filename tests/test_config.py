@@ -13,7 +13,9 @@ def test_defaults_and_roundtrip(tmp_path: Path) -> None:
     assert path.exists()
     assert store.get().hotkey == "ctrl+alt+space"
 
-    store.update(language="en", beam_size=3, history_limit=50)
+    store.update(
+        model_type="faster_whisper", language="en", beam_size=3, history_limit=50
+    )
     reloaded = ConfigStore(path)
     assert reloaded.load() == []
     cfg = reloaded.get()
@@ -34,7 +36,7 @@ def test_invalid_values_are_coerced() -> None:
             "history_limit": 0,
         }
     )
-    assert cfg.language == "auto"
+    assert cfg.language == "ru"
     assert cfg.beam_size == 10
     assert cfg.sample_rate == 8000
     assert cfg.hotkey == "ctrl+alt+space"
@@ -69,10 +71,26 @@ def test_listener_receives_validated_config(tmp_path: Path) -> None:
     store.load()
     seen: list[Config] = []
     store.subscribe(seen.append)
-    store.update(language="EN", beam_size=0)
+    store.update(model_type="faster_whisper", language="EN", beam_size=0)
     assert len(seen) == 1
     assert seen[0].language == "en"
     assert seen[0].beam_size == 1
+
+
+def test_language_is_russian_only_without_whisper() -> None:
+    for engine in ("auto", "gigaam", "tone"):
+        cfg, warnings = validate_mapping({"model_type": engine, "language": "en"})
+        assert cfg.language == "ru"
+        assert warnings
+
+    whisper, _ = validate_mapping({"model_type": "faster_whisper", "language": "en"})
+    assert whisper.language == "en"
+    whisper_auto, _ = validate_mapping({"model_type": "faster_whisper", "language": "auto"})
+    assert whisper_auto.language == "auto"
+
+    default, warnings = validate_mapping({})
+    assert default.language == "ru"
+    assert not warnings
 
 
 def test_persisted_json_has_schema_version(tmp_path: Path) -> None:

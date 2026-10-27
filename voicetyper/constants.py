@@ -3,7 +3,7 @@
 APP_ID = "VoiceTyper"
 APP_NAME = "VoiceTyper"
 APP_TITLE = "Voice Typer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CONFIG_VERSION = 3
 HISTORY_VERSION = 1
 
@@ -21,6 +21,10 @@ LANGUAGES = (
     "zh",
     "ja",
 )
+
+# GigaAM v3 and T-one recognise Russian only, so language choice belongs to
+# Whisper alone.
+MULTILINGUAL_ENGINES = ("faster_whisper",)
 
 WHISPER_MODELS = (
     "tiny",

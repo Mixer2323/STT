@@ -69,7 +69,9 @@ for package in ("ctranslate2", "tokenizers", "av", "onnxruntime.capi", "PIL"):
     except Exception:
         pass
 
-for package in ("ctranslate2", "av", "onnxruntime", "pyctcdecode", "PIL"):
+# faster_whisper ships the Silero VAD ONNX models under assets/; without them
+# every transcription fails at runtime when vad_filter is enabled.
+for package in ("faster_whisper", "ctranslate2", "av", "onnxruntime", "pyctcdecode", "PIL"):
     try:
         datas += collect_data_files(package)
     except Exception:

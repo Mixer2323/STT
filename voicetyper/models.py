@@ -11,7 +11,6 @@ from typing import Callable, Optional
 from .config import Config, ConfigStore
 from .constants import STATUS_ERROR, STATUS_IDLE, STATUS_LOADING, STATUS_READY
 from .engines import Engine, create_engine, resolve_engine_name
-from .engines.registry import language_warning
 from .hardware import detect_hardware
 
 logger = logging.getLogger(__name__)
@@ -269,10 +268,6 @@ class ModelManager:
         hw = detect_hardware()
 
         warnings: list[str] = []
-        warning = language_warning(name, cfg.language)
-        if warning:
-            warnings.append(warning)
-            logger.warning(warning)
 
         last_emit = [0.0]
 

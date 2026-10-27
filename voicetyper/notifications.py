@@ -9,6 +9,15 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Windows tray balloons reject strings longer than 256 characters.
+_MAX_TITLE = 100
+_MAX_MESSAGE = 240
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
 
 class Notifier:
     def __init__(self, enabled: bool = True):
@@ -43,7 +52,7 @@ class Notifier:
             logger.info("%s: %s", title, message)
             return False
         try:
-            icon.notify(message, title)
+            icon.notify(_clip(message, _MAX_MESSAGE), _clip(title, _MAX_TITLE))
             return True
         except Exception:
             logger.warning("Не удалось показать уведомление «%s»", title, exc_info=True)

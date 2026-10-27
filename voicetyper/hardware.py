@@ -241,7 +241,6 @@ def choose_engine_name(cfg: Config, hw: HardwareInfo, availability: dict[str, En
         return cfg.model_type
 
     installed = {name: info.installed for name, info in availability.items()}
-    language = cfg.language or "auto"
     ram = hw.ram_gb or 0
 
     def first_available(*names: str) -> Optional[str]:
@@ -250,20 +249,13 @@ def choose_engine_name(cfg: Config, hw: HardwareInfo, availability: dict[str, En
                 return name
         return None
 
-    if language in ("ru", "auto"):
-        # GigaAM gives the best Russian quality/size ratio; T-one is the
-        # low-memory fallback; Whisper is the multilingual fallback.
-        if installed.get("gigaam") and (ram == 0 or ram >= 4):
-            return "gigaam"
-        if installed.get("tone") and (ram == 0 or ram >= 4):
-            return "tone"
-        fallback = first_available("faster_whisper", "gigaam", "tone")
-        return fallback or "none"
-
-    if installed.get("faster_whisper"):
-        return "faster_whisper"
-    fallback = first_available("tone", "gigaam")
-    return fallback or "none"
+    # "auto" is Russian-only now, so GigaAM gives the best quality/size ratio,
+    # T-one is the low-memory fallback and Whisper the multilingual fallback.
+    if installed.get("gigaam") and (ram == 0 or ram >= 4):
+        return "gigaam"
+    if installed.get("tone") and (ram == 0 or ram >= 4):
+        return "tone"
+    return first_available("faster_whisper", "gigaam", "tone") or "none"
 
 
 def format_bytes(size: float) -> str:

@@ -24,11 +24,6 @@ ENGINE_CLASSES = {
     "tone": "voicetyper.engines.tone:ToneEngine",
 }
 
-ENGINE_LANGUAGE_WARNING = {
-    "gigaam": "GigaAM v3 распознаёт только русскую речь",
-    "tone": "T-one распознаёт только русскую речь",
-}
-
 
 def describe_engines() -> dict[str, EngineAvailability]:
     return engine_availability()
@@ -55,9 +50,3 @@ def create_engine(
     if name in ("faster_whisper", "tone"):
         return engine_class(cfg=cfg, hw=hw, progress=progress, cancel_event=cancel_event)
     return engine_class(progress=progress, cancel_event=cancel_event)
-
-
-def language_warning(name: str, language: str) -> Optional[str]:
-    if language in ("ru", "auto"):
-        return None
-    return ENGINE_LANGUAGE_WARNING.get(name)

@@ -23,6 +23,7 @@ from .constants import (
     APP_VERSION,
     ENGINE_LABELS,
     ENGINE_ORDER,
+    MULTILINGUAL_ENGINES,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_READY,
@@ -638,6 +639,8 @@ class VoiceTyperApp:
         self.models.request(force=True, cfg=cfg)
 
     def set_language(self, code: str) -> None:
+        if self.config_store.get().model_type not in MULTILINGUAL_ENGINES:
+            return
         cfg = self._save(language=code)
         logger.info("Выбран язык: %s", code)
         self.models.request(force=True, cfg=cfg)

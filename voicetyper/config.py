@@ -21,6 +21,7 @@ from .constants import (
     HOTKEY_MODES,
     INSERT_MODES,
     LANGUAGES,
+    MULTILINGUAL_ENGINES,
     TONE_DECODERS,
     WHISPER_MODELS,
 )
@@ -39,7 +40,7 @@ class Config:
     version: int = CONFIG_VERSION
     hotkey: str = DEFAULT_HOTKEY
     hotkey_mode: str = "hold"  # hold | toggle
-    language: str = "auto"
+    language: str = "ru"
     model_type: str = "auto"
     whisper_model: str = "large-v3-turbo"
     tone_decoder: str = "auto"
@@ -197,6 +198,15 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
     choice("device", DEVICES)
     choice("compute_type", COMPUTE_TYPES)
     choice("insert_mode", INSERT_MODES)
+
+    # Only Whisper can recognise other languages; the Russian-only engines
+    # ignore the setting, so keep it pinned to "ru" for them.
+    if cfg.model_type not in MULTILINGUAL_ENGINES and cfg.language != "ru":
+        if "language" in raw:
+            warnings.append(
+                "Выбор языка доступен только для Faster-Whisper; установлен русский"
+            )
+        cfg.language = "ru"
 
     if "hotkey" in raw:
         hotkey = str(raw["hotkey"]).strip() if raw["hotkey"] is not None else ""

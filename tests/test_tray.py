@@ -57,3 +57,27 @@ def test_left_click_starts_settings_and_stops_recording(tmp_path, monkeypatch) -
 
     recording = tray_module.TrayController(_MenuApp(recording=True), store)
     assert _default_text(recording.build_menu()) == "Остановить запись"
+
+
+def _language_items(menu):
+    item = next(item for item in menu.items if item.text == "Язык")
+    return list(item.submenu.items)
+
+
+def test_language_menu_is_limited_without_whisper(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(tray_module, "describe_engines", lambda: {})
+    store = ConfigStore(tmp_path / "config.json")
+    store.load()
+
+    for engine in ("auto", "gigaam", "tone"):
+        store.update(model_type=engine)
+        items = _language_items(tray_module.TrayController(_MenuApp(False), store).build_menu())
+        assert len(items) == 1
+        assert items[0].text.startswith("Русский")
+        assert items[0].enabled is False
+        assert items[0].checked is True
+
+    store.update(model_type="faster_whisper")
+    items = _language_items(tray_module.TrayController(_MenuApp(False), store).build_menu())
+    assert len(items) > 1
+    assert all(item.enabled for item in items)
