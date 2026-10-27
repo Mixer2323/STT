@@ -200,8 +200,16 @@ def detect_hardware(probe_path: str | None = None) -> HardwareInfo:
     )
 
 
-def resolve_whisper_runtime(cfg: Config, hw: HardwareInfo) -> tuple[str, str, list[str]]:
-    """Return ``(device, compute_type, warnings)`` for faster-whisper."""
+def resolve_whisper_runtime(
+    cfg: Config, hw: HardwareInfo, cudnn_ready: Optional[bool] = None
+) -> tuple[str, str, list[str]]:
+    """Return ``(device, compute_type, warnings)`` for faster-whisper.
+
+    On Windows the CUDA path is only chosen when a complete cuDNN 9 runtime is
+    available: CTranslate2 ships just the loader stub and fails fast
+    (``0xc0000409``) without the split libraries. Preloading happens here so
+    that it runs before ``faster_whisper`` is imported.
+    """
     warnings: list[str] = []
     device = cfg.device
     if device == "cuda" and not hw.cuda:
@@ -211,6 +219,19 @@ def resolve_whisper_runtime(cfg: Config, hw: HardwareInfo) -> tuple[str, str, li
         device = "cuda" if hw.cuda else "cpu"
         if hw.cuda and (hw.vram_gb or 0) < 3:
             warnings.append("Меньше 3 ГБ VRAM: Whisper может не поместиться в память GPU")
+
+    if device == "cuda" and sys.platform == "win32":
+        if cudnn_ready is None:
+            from .cudnn_runtime import ensure_cudnn
+
+            cudnn_ready = ensure_cudnn() is not None
+        if not cudnn_ready:
+            warnings.append(
+                "cuDNN 9 не найден — Whisper работает на CPU. Установите cuDNN 9 "
+                "от NVIDIA, чтобы распознавать на GPU"
+            )
+            logger.warning("Whisper: %s", warnings[-1])
+            device = "cpu"
 
     if cfg.compute_type != "auto":
         compute = cfg.compute_type

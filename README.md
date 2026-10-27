@@ -69,8 +69,8 @@ voice_typer.py / python -m voicetyper
 - Windows 10/11 x64;
 - Python 3.10+ для запуска из исходников;
 - микрофон;
-- опционально NVIDIA GPU. Faster-Whisper использует CUDA при наличии
-  CUDA-библиотек, иначе автоматически переходит на CPU.
+- опционально NVIDIA GPU. Faster-Whisper использует CUDA, если установлен
+  полный runtime cuDNN 9; без него автоматически переходит на CPU.
 
 ## Установка и запуск
 

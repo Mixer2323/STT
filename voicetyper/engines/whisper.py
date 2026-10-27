@@ -111,6 +111,14 @@ class WhisperEngine(Engine):
             raise EngineError(f"Модель Whisper не найдена в {self.model_dir}")
 
     def _load(self) -> None:
+        # Resolve before importing faster_whisper: on Windows this preloads a
+        # complete system cuDNN 9, without which CTranslate2 terminates the
+        # process with 0xc0000409 instead of raising a Python exception.
+        device, compute, warnings = resolve_whisper_runtime(self.cfg, self.hw)
+        self.warnings.extend(warnings)
+        for warning in warnings:
+            logger.warning("Whisper: %s", warning)
+
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:
@@ -119,10 +127,6 @@ class WhisperEngine(Engine):
             ) from exc
 
         self._ensure_files()
-        device, compute, warnings = resolve_whisper_runtime(self.cfg, self.hw)
-        self.warnings.extend(warnings)
-        for warning in warnings:
-            logger.warning("Whisper: %s", warning)
 
         try:
             model_size = sum(item.stat().st_size for item in self.model_dir.glob("*"))

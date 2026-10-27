@@ -123,6 +123,21 @@ a = Analysis(
     noarchive=False,
 )
 
+# ctranslate2 ships only the cuDNN 9 loader stub without the split runtime
+# libraries. Loading that stub in a frozen build kills the process with
+# 0xc0000409, so the app preloads a complete system cuDNN 9 instead
+# (voicetyper.cudnn_runtime). Filter after Analysis because the DLL arrives
+# through collect_data_files and PyInstaller's binary reclassification as well.
+def _without_cudnn_loader(entries):
+    return [
+        entry for entry in entries
+        if os.path.basename(entry[0]).lower() != "cudnn64_9.dll"
+    ]
+
+
+a.binaries = _without_cudnn_loader(a.binaries)
+a.datas = _without_cudnn_loader(a.datas)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
