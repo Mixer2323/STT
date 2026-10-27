@@ -81,7 +81,7 @@ python -m voicetyper
 
 `tone` устанавливается из GitHub (`voicekit-team/T-one`), `gigastt` — из PyPI.
 Модели скачиваются при первом использовании. Прогресс виден в меню трея.
-Быстрее — скачать готовые архивы из [релиза моделей](https://github.com/mixer232323-web/STT/releases/tag/models-v1)
+Быстрее — скачать готовые архивы из [релиза моделей](https://github.com/Mixer2323/STT/releases/tag/models-v1)
 и распаковать их в папку моделей (см. раздел «Готовые пакеты моделей»).
 
 После запуска дождитесь статуса «Готово», поставьте курсор в нужное окно и
@@ -130,7 +130,7 @@ python -m voicetyper
 ### Готовые пакеты моделей (рекомендуется)
 
 Самый быстрый способ установки — скачать архивы со страницы
-[релиза моделей](https://github.com/mixer232323-web/STT/releases/tag/models-v1).
+[релиза моделей](https://github.com/Mixer2323/STT/releases/tag/models-v1).
 Каждый архив распаковывается в свою подпапку каталога моделей (`models\` рядом
 с программой, `%LOCALAPPDATA%\VoiceTyper\models\` или `data\models\` в
 портативном режиме):

@@ -16,7 +16,7 @@ from typing import Callable, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 _CHUNK = 256 * 1024
-_USER_AGENT = "VoiceTyper/1.0 (+https://github.com/mixer232323-web/STT)"
+_USER_AGENT = "VoiceTyper/1.0 (+https://github.com/Mixer2323/STT)"
 
 
 class DownloadError(RuntimeError):

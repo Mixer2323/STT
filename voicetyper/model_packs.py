@@ -20,7 +20,7 @@ from .downloads import DownloadCancelled, DownloadError, DownloadProgress, downl
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "mixer232323-web/STT"
+GITHUB_REPO = "Mixer2323/STT"
 MODELS_RELEASE_TAG = "models-v1"
 MODELS_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases/tag/{MODELS_RELEASE_TAG}"
 MODELS_DOWNLOAD_BASE = f"https://github.com/{GITHUB_REPO}/releases/download/{MODELS_RELEASE_TAG}"
@@ -173,6 +173,15 @@ def download_pack(
     if pack_ready(pack, target_dir):
         _report(report, f"{pack.title}: файлы уже на месте", 100.0)
         return target_dir
+
+    try:
+        free = shutil.disk_usage(target_dir).free
+    except OSError:
+        free = None
+    if free is not None and free < pack.size * 2 + 128 * 1024 * 1024:
+        raise DownloadError(
+            f"Недостаточно места для {pack.asset}: нужно около {human_size(pack.size * 2)}"
+        )
 
     archive_path = target_dir / f".{pack.asset}.download"
 
