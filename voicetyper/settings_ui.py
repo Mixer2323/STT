@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import paths
-from .audio import HAS_SOUNDDEVICE, list_input_devices
+from .audio import HAS_SOUNDDEVICE, list_input_devices, refresh_input_devices
 from .config import ConfigStore
 from .constants import (
     APP_TITLE,
@@ -842,6 +842,10 @@ class SettingsWindow:
             self._loading = False
 
     def _refresh_devices(self) -> None:
+        # PortAudio caches the device list; in an RDP session it is rebuilt
+        # when the client connects, so re-enumerate before showing the list.
+        if not getattr(self._app, "is_recording", False):
+            refresh_input_devices()
         self._devices = list_input_devices()
         self._device_labels = ["Системный по умолчанию"]
         self._device_values = [None]

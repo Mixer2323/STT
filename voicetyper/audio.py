@@ -128,23 +128,80 @@ def default_input_device() -> Optional[InputDevice]:
     return None
 
 
+def is_remote_session() -> bool:
+    """True inside a Remote Desktop / terminal-services session."""
+    if os.name != "nt":
+        return False
+    if os.environ.get("SESSIONNAME", "").strip().upper().startswith("RDP-"):
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.GetSystemMetrics(0x1000))  # SM_REMOTESESSION
+    except Exception:
+        return False
+
+
+def refresh_input_devices() -> bool:
+    """Re-enumerate PortAudio devices.
+
+    PortAudio caches the device list on initialization. In an RDP session the
+    set of audio devices changes when the client connects or disconnects, so
+    the cached list (and the default device index) can become stale.
+    """
+    if not HAS_SOUNDDEVICE:
+        return False
+    terminate = getattr(sd, "_terminate", None)
+    initialize = getattr(sd, "_initialize", None)
+    if terminate is None or initialize is None:
+        return False
+    try:
+        terminate()
+        initialize()
+    except Exception:
+        logger.warning("Не удалось обновить список аудиоустройств", exc_info=True)
+        return False
+    logger.debug("Список аудиоустройств обновлён")
+    return True
+
+
+def _system_default_input() -> Optional[int]:
+    if not HAS_SOUNDDEVICE:
+        return None
+    try:
+        default = sd.default.device[0]
+    except Exception:
+        return None
+    try:
+        index = int(default)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
 def resolve_input_device(value: int | str | None) -> Optional[int]:
-    """Map a config value (index or name) to a sounddevice index."""
+    """Map a config value (index or name) to a sounddevice index.
+
+    Device numbering is not stable across sessions: after an RDP client
+    connects or disconnects the list is rebuilt and the saved index may point
+    to another device or disappear. In that case fall back to the system
+    default instead of making recording impossible.
+    """
     if not HAS_SOUNDDEVICE:
         raise AudioError("sounddevice не установлен — запись недоступна")
     if value is None or value == "":
-        try:
-            default = sd.default.device[0]
-        except Exception:
-            default = None
-        return int(default) if default is not None and default >= 0 else None
+        return _system_default_input()
 
     devices = list_input_devices()
     if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
         index = int(value)
         if any(device.index == index for device in devices):
             return index
-        raise AudioError(f"Микрофон с индексом {index} не найден")
+        logger.warning(
+            "Микрофон с индексом %s не найден — используется системный по умолчанию",
+            index,
+        )
+        return _system_default_input()
 
     needle = str(value).strip().casefold()
     exact = [device for device in devices if device.name.casefold() == needle]
@@ -156,7 +213,31 @@ def resolve_input_device(value: int | str | None) -> Optional[int]:
     if len(partial) > 1:
         names = ", ".join(device.name for device in partial[:4])
         raise AudioError(f"Название «{value}» подходит к нескольким микрофонам: {names}")
-    raise AudioError(f"Микрофон «{value}» не найден")
+    logger.warning(
+        "Микрофон «%s» не найден — используется системный по умолчанию", value
+    )
+    return _system_default_input()
+
+
+def _no_input_device_message() -> str:
+    message = "Микрофоны не найдены"
+    if is_remote_session():
+        message += (
+            ". В сеансе RDP включите перенаправление микрофона: «Локальные ресурсы» → "
+            "«Звук» → «Параметры» → «Запись с этого компьютера», затем перезапустите приложение"
+        )
+    return message + "."
+
+
+def _open_microphone_message(error: Optional[BaseException]) -> str:
+    detail = str(error) if error else "устройство недоступно"
+    message = f"Не удалось открыть микрофон: {detail}"
+    if is_remote_session():
+        message += (
+            " Проверьте перенаправление микрофона в RDP: «Локальные ресурсы» → "
+            "«Звук» → «Параметры» → «Запись с этого компьютера»."
+        )
+    return message
 
 
 def _resample_float(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -331,6 +412,7 @@ class RecordingSession:
         self._stopped = False
         self._result: Optional[RecordingResult] = None
         self._capture_rate = int(cfg.sample_rate)
+        self._capture_channels = 1
         self._auto_stop_fired = False
         self._last_level_at = 0.0
         self._overflowed = False
@@ -349,33 +431,96 @@ class RecordingSession:
         with self._lock:
             return self._result
 
-    def _pick_samplerate(self, device_index: Optional[int]) -> int:
+    def _candidate_formats(self, device_index: Optional[int]) -> list[tuple[int, int]]:
+        """Return (samplerate, channels) pairs to try, most likely first.
+
+        MME (the Windows host API PortAudio picks by default) can report a
+        format as supported through ``check_input_settings`` yet still fail
+        ``waveInOpen`` with ``MMSYSERR_INVALPARAM`` (PortAudio's "MME error
+        11") for sample rates the driver does not really accept — typical for
+        the RDP audio redirection device and Bluetooth hands-free mics. So we
+        prefer the device's own default rate and also try mono/stereo.
+        """
         assert sd is not None
         requested = int(self.cfg.sample_rate)
-        candidates = [requested]
+        default_rate = 0
+        max_channels = 1
         try:
             info = sd.query_devices(device_index, "input")
             default_rate = int(round(float(info.get("default_samplerate", 0) or 0)))
-            if default_rate and default_rate not in candidates:
-                candidates.append(default_rate)
+            max_channels = max(1, int(info.get("max_input_channels", 1) or 1))
         except Exception:
             pass
-        candidates.extend([16000, 48000, 44100])
-        for rate in dict.fromkeys(candidates):
-            try:
-                sd.check_input_settings(
-                    device=device_index,
-                    channels=1,
-                    dtype="int16",
-                    samplerate=rate,
-                )
-                return rate
-            except Exception:
-                continue
-        raise AudioError(
-            "Микрофон не поддерживает моно-запись 16 кГц. "
-            "Выберите другое устройство в настройках."
+
+        rates = [
+            rate
+            for rate in (default_rate, 48000, 44100, requested, 16000, 8000)
+            if rate > 0
+        ]
+        channel_options = [1]
+        if max_channels >= 2:
+            channel_options.append(2)
+
+        formats: list[tuple[int, int]] = []
+        for rate in dict.fromkeys(rates):
+            for channels in channel_options:
+                formats.append((rate, channels))
+        return formats
+
+    def _open_stream(self, device_index: Optional[int], rate: int, channels: int):
+        assert sd is not None
+        stream = sd.InputStream(
+            device=device_index,
+            samplerate=rate,
+            channels=channels,
+            dtype="int16",
+            blocksize=0,
+            callback=self._callback,
         )
+        try:
+            stream.start()
+        except Exception:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            raise
+        return stream
+
+    def _open_first_available(self) -> tuple[object, int, int, Optional[int]]:
+        assert sd is not None
+        device_index = resolve_input_device(self.cfg.input_device)
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(2):
+            if attempt:
+                if not refresh_input_devices():
+                    break
+                # Device indices can shift after the PortAudio restart.
+                device_index = resolve_input_device(self.cfg.input_device)
+
+            for rate, channels in self._candidate_formats(device_index):
+                try:
+                    stream = self._open_stream(device_index, rate, channels)
+                except Exception as exc:
+                    last_error = exc
+                    logger.debug(
+                        "Не удалось открыть микрофон (%s, %d Гц, %d кан.): %s",
+                        device_index if device_index is not None else "default",
+                        rate,
+                        channels,
+                        exc,
+                    )
+                    continue
+                if attempt:
+                    logger.info(
+                        "Список аудиоустройств обновлён — микрофон открыт заново"
+                    )
+                return stream, rate, channels, device_index
+
+        if not list_input_devices():
+            raise AudioError(_no_input_device_message())
+        raise AudioError(_open_microphone_message(last_error))
 
     def start(self) -> None:
         if not HAS_SOUNDDEVICE:
@@ -383,28 +528,17 @@ class RecordingSession:
         with self._lock:
             if self._started:
                 return
-            device_index = resolve_input_device(self.cfg.input_device)
-            self._capture_rate = self._pick_samplerate(device_index)
-            blocksize = max(256, int(self._capture_rate * 0.064))
-            try:
-                self._stream = sd.InputStream(
-                    device=device_index,
-                    samplerate=self._capture_rate,
-                    channels=1,
-                    dtype="int16",
-                    blocksize=blocksize,
-                    callback=self._callback,
-                )
-                self._stream.start()
-            except Exception as exc:
-                self._stream = None
-                raise AudioError(f"Не удалось открыть микрофон: {exc}") from exc
+            stream, rate, channels, device_index = self._open_first_available()
+            self._stream = stream
+            self._capture_rate = rate
+            self._capture_channels = channels
             self._started = True
             self._stopped = False
         logger.info(
-            "Запись начата: устройство=%s, %d Гц",
+            "Запись начата: устройство=%s, %d Гц, каналов=%d",
             device_index if device_index is not None else "default",
             self._capture_rate,
+            self._capture_channels,
         )
 
     def _callback(self, indata, frames, _time_info, status) -> None:

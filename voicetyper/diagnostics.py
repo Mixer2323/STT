@@ -38,6 +38,12 @@ def collect_diagnostics(
     lines.append(f"ОС: {platform.platform()}")
     lines.append(f"Python: {platform.python_version()} ({sys.executable})")
     lines.append(f"Сборка PyInstaller: {_yes(getattr(sys, 'frozen', False))}")
+    try:
+        from .audio import is_remote_session
+
+        lines.append(f"Сеанс RDP: {_yes(is_remote_session())}")
+    except Exception:
+        pass
     lines.append(f"Железо: {hw.summary()}")
     lines.append(f"Свободно на диске моделей: {format_bytes(hw.free_disk_gb * 1024**3) if hw.free_disk_gb else '?'}")
     lines.append("")
