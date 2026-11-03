@@ -29,20 +29,55 @@ class FakeStream:
 class FakeSoundDevice:
     """Minimal sounddevice stand-in for the device/open retry logic."""
 
-    def __init__(self, devices, default_index, *, failing=None, fail_until_refresh=None):
+    def __init__(
+        self,
+        devices,
+        default_index,
+        *,
+        wasapi_default=None,
+        failing=None,
+        failing_devices=None,
+        fail_until_refresh=None,
+    ):
         self._devices = devices
         self.default = SimpleNamespace(device=[default_index, -1])
+        self.wasapi_default = wasapi_default
         self.failing = failing or set()
+        self.failing_devices = failing_devices or set()
         self.fail_until_refresh = fail_until_refresh
         self.opened: list[tuple[object, int, int]] = []
         self.refreshed = 0
 
     def query_hostapis(self):
-        return [{"name": "MME"}]
+        return [
+            {"name": "MME", "default_input_device": self.default.device[0]},
+            {
+                "name": "Windows WASAPI",
+                "default_input_device": (
+                    self.wasapi_default if self.wasapi_default is not None else -1
+                ),
+            },
+        ]
 
     def query_devices(self, device=None, kind=None):
         if device is None and kind is None:
-            return self._devices
+            size = max((item["index"] for item in self._devices), default=-1) + 1
+            result = []
+            for index in range(size):
+                match = next(
+                    (item for item in self._devices if item["index"] == index), None
+                )
+                result.append(
+                    match
+                    if match is not None
+                    else {
+                        "name": f"unused-{index}",
+                        "max_input_channels": 0,
+                        "default_samplerate": 44100.0,
+                        "hostapi": 0,
+                    }
+                )
+            return result
         index = self.default.device[0] if device is None else int(device)
         for item in self._devices:
             if item["index"] == index:
@@ -53,6 +88,8 @@ class FakeSoundDevice:
         self.opened.append((device, samplerate, channels))
         if not self._devices:
             raise RuntimeError("Error opening InputStream: no input device")
+        if device in self.failing_devices:
+            raise RuntimeError("Error opening InputStream: MME error 11")
         if samplerate in self.failing:
             raise RuntimeError("Error opening InputStream: MME error 11")
         if self.fail_until_refresh is not None and self.refreshed == 0:
@@ -66,13 +103,20 @@ class FakeSoundDevice:
         pass
 
 
-def _device(index: int, name: str, *, channels: int = 1, rate: float = 44100.0) -> dict:
+def _device(
+    index: int,
+    name: str,
+    *,
+    channels: int = 1,
+    rate: float = 44100.0,
+    hostapi: int = 0,
+) -> dict:
     return {
         "index": index,
         "name": name,
         "max_input_channels": channels,
         "default_samplerate": rate,
-        "hostapi": 0,
+        "hostapi": hostapi,
     }
 
 
@@ -136,3 +180,45 @@ def test_no_devices_reports_rdp_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     message = str(excinfo.value)
     assert "Микрофоны не найдены" in message
     assert "RDP" in message
+
+
+def test_wasapi_is_preferred_for_default_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [
+        _device(1, "Удалённое аудио", hostapi=0),
+        _device(2, "Удалённое аудио", hostapi=1, channels=1, rate=48000.0),
+    ]
+    fake = FakeSoundDevice(
+        devices, default_index=1, wasapi_default=2, failing_devices={1}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert fake.opened[0] == (2, 48000, 1)
+    assert session.capture_rate == 48000
+    assert session._stream.device == 2
+    session.stop()
+
+
+def test_explicit_device_falls_back_to_wasapi_equivalent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [
+        _device(1, "Микрофон (USB PnP Audio Device)", hostapi=0),
+        _device(2, "Микрофон (USB PnP Audio Device)", hostapi=1, rate=48000.0),
+    ]
+    fake = FakeSoundDevice(
+        devices, default_index=1, wasapi_default=2, failing_devices={1}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config(input_device=1))
+    session.start()
+
+    assert fake.opened[0][0] == 1
+    assert fake.opened[-1][0] == 2
+    assert session._stream.device == 2
+    session.stop()

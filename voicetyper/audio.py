@@ -179,6 +179,59 @@ def _system_default_input() -> Optional[int]:
     return index if index >= 0 else None
 
 
+def _wasapi_default_input() -> Optional[int]:
+    """PortAudio index of the default WASAPI input device, if available.
+
+    Windows apps normally capture through WASAPI (shared mode). PortAudio's
+    default input, however, is usually the MME "Sound Mapper", and MME cannot
+    open the RDP "Remote Audio" endpoint at all (MMSYSERR_INVALPARAM / error
+    11), even though other applications record from it without problems.
+    """
+    if not HAS_SOUNDDEVICE:
+        return None
+    try:
+        for hostapi in sd.query_hostapis():
+            if "wasapi" not in str(hostapi.get("name", "")).casefold():
+                continue
+            index = int(hostapi.get("default_input_device", -1))
+            return index if index >= 0 else None
+    except Exception:
+        logger.debug("Не удалось определить устройство WASAPI", exc_info=True)
+    return None
+
+
+def _same_device_name(first: str, second: str) -> bool:
+    """Compare device names across host APIs, tolerating MME truncation."""
+    a = first.strip().casefold()
+    b = second.strip().casefold()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 12 and long.startswith(short)
+
+
+def _wasapi_equivalent(device_index: Optional[int]) -> Optional[int]:
+    """Find the WASAPI entry for the same physical device."""
+    if not HAS_SOUNDDEVICE or device_index is None:
+        return None
+    try:
+        name = str(sd.query_devices(device_index, "input").get("name", ""))
+    except Exception:
+        return None
+    if not name:
+        return None
+    for device in list_input_devices():
+        if device.index == device_index:
+            continue
+        if "wasapi" not in device.hostapi.casefold():
+            continue
+        if _same_device_name(device.name, name):
+            return device.index
+    return None
+
+
 def resolve_input_device(value: int | str | None) -> Optional[int]:
     """Map a config value (index or name) to a sounddevice index.
 
@@ -487,6 +540,34 @@ class RecordingSession:
             raise
         return stream
 
+    def _candidate_devices(self, device_index: Optional[int]) -> list[Optional[int]]:
+        """Device indices to try, best first.
+
+        On Windows the WASAPI endpoint is preferred: it is what other
+        applications use, and MME/DirectSound cannot open the RDP "Remote
+        Audio" device. An explicitly selected device is tried first, with its
+        WASAPI equivalent as a fallback.
+        """
+        wasapi_default = _wasapi_default_input()
+        explicit = self.cfg.input_device not in (None, "")
+        ordered: list[Optional[int]] = []
+
+        def add(index: Optional[int]) -> None:
+            if index is not None and index not in ordered:
+                ordered.append(index)
+
+        if not explicit:
+            add(wasapi_default)
+        if device_index is not None:
+            add(device_index)
+        if explicit:
+            add(_wasapi_equivalent(device_index))
+        add(_system_default_input())
+        add(wasapi_default)
+        if not ordered:
+            ordered.append(None)
+        return ordered
+
     def _open_first_available(self) -> tuple[object, int, int, Optional[int]]:
         assert sd is not None
         device_index = resolve_input_device(self.cfg.input_device)
@@ -499,24 +580,25 @@ class RecordingSession:
                 # Device indices can shift after the PortAudio restart.
                 device_index = resolve_input_device(self.cfg.input_device)
 
-            for rate, channels in self._candidate_formats(device_index):
-                try:
-                    stream = self._open_stream(device_index, rate, channels)
-                except Exception as exc:
-                    last_error = exc
-                    logger.debug(
-                        "Не удалось открыть микрофон (%s, %d Гц, %d кан.): %s",
-                        device_index if device_index is not None else "default",
-                        rate,
-                        channels,
-                        exc,
-                    )
-                    continue
-                if attempt:
-                    logger.info(
-                        "Список аудиоустройств обновлён — микрофон открыт заново"
-                    )
-                return stream, rate, channels, device_index
+            for candidate in self._candidate_devices(device_index):
+                for rate, channels in self._candidate_formats(candidate):
+                    try:
+                        stream = self._open_stream(candidate, rate, channels)
+                    except Exception as exc:
+                        last_error = exc
+                        logger.debug(
+                            "Не удалось открыть микрофон (%s, %d Гц, %d кан.): %s",
+                            candidate if candidate is not None else "default",
+                            rate,
+                            channels,
+                            exc,
+                        )
+                        continue
+                    if attempt:
+                        logger.info(
+                            "Список аудиоустройств обновлён — микрофон открыт заново"
+                        )
+                    return stream, rate, channels, candidate
 
         if not list_input_devices():
             raise AudioError(_no_input_device_message())
