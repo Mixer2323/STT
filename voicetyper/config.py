@@ -50,11 +50,13 @@ class Config:
     vad_filter: bool = True
     sample_rate: int = 16000
     input_device: int | str | None = None
+    server_microphone: bool = False
     max_recording_seconds: int = 300
     exclude_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_PHRASES))
-    insert_mode: str = "paste"  # paste | clipboard | type
+    insert_mode: str = "paste"  # paste | clipboard | type | type_scancode
     restore_clipboard: bool = True
     paste_delay_ms: int = 80
+    type_delay_ms: int = 12
     restore_target_window: bool = True
     trim_silence: bool = True
     capitalize: bool = True
@@ -232,6 +234,11 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
         "paste_delay_ms вне диапазона 0..2000",
     )
     check(
+        "type_delay_ms",
+        lambda v, d: _as_int(v, d, 0, 500),
+        "type_delay_ms вне диапазона 0..500",
+    )
+    check(
         "history_limit",
         lambda v, d: _as_int(v, d, 0, 10000),
         "history_limit вне диапазона 0..10000",
@@ -239,6 +246,7 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
 
     for name in (
         "vad_filter",
+        "server_microphone",
         "restore_clipboard",
         "restore_target_window",
         "trim_silence",

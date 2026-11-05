@@ -105,6 +105,11 @@ class RecordingResult:
         return self.path is not None and self.path.exists() and not self.error
 
 
+def _clean_device_name(value: object) -> str:
+    """Device names arrive with driver line breaks; keep them on one line."""
+    return " ".join(str(value or "").split())
+
+
 def list_input_devices() -> list[InputDevice]:
     if not HAS_SOUNDDEVICE:
         return []
@@ -122,7 +127,7 @@ def list_input_devices() -> list[InputDevice]:
             devices.append(
                 InputDevice(
                     index=index,
-                    name=str(info.get("name", f"Device {index}")),
+                    name=_clean_device_name(info.get("name", f"Device {index}")),
                     channels=channels,
                     default_samplerate=float(info.get("default_samplerate", 0) or 0),
                     hostapi=api_name,
@@ -237,7 +242,7 @@ def _wasapi_equivalent(device_index: Optional[int]) -> Optional[int]:
     if not HAS_SOUNDDEVICE or device_index is None:
         return None
     try:
-        name = str(sd.query_devices(device_index, "input").get("name", ""))
+        name = _clean_device_name(sd.query_devices(device_index, "input").get("name", ""))
     except Exception:
         return None
     if not name:
@@ -275,12 +280,20 @@ def _device_name(device_index: Optional[int]) -> str:
     if not HAS_SOUNDDEVICE or device_index is None:
         return ""
     try:
-        return str(sd.query_devices(device_index, "input").get("name", ""))
+        return _clean_device_name(sd.query_devices(device_index, "input").get("name", ""))
     except Exception:
         return ""
 
 
 _MIXER_ENDPOINT_HINTS = ("микшер", "stereo mix", "what u hear", "mixer", "loopback")
+# MME and DirectSound add a routing pseudo-device on top of the real endpoints;
+# it is not a microphone the user can pick.
+_PSEUDO_ENDPOINT_HINTS = (
+    "sound mapper",
+    "переназнач",
+    "primary sound capture",
+    "первичный драйвер",
+)
 _MICROPHONE_HINTS = (
     "микрофон",
     "microphone",
@@ -289,10 +302,14 @@ _MICROPHONE_HINTS = (
     "headset",
     "головн",
 )
-# WDM-KS talks to the hardware directly, so it still sees the microphones
-# attached to the server when an RDP session's WASAPI only exposes the
-# redirected endpoint. MME and DirectSound mirror the session endpoints.
-_LAST_RESORT_HOST_APIS = ("wdm-ks", "directsound", "mme")
+# PortAudio lists every session endpoint once per host API (MME, DirectSound,
+# WASAPI), so the same microphone shows up several times. WDM-KS is different:
+# it talks to the kernel wavePort directly, so in an RDP session it still
+# reports the microphones plugged into the server even though the session's
+# audio engine exposes only the redirected endpoint.
+_KERNEL_HOST_API = "wdm-ks"
+# Which entry wins when one endpoint appears under several host APIs.
+_VISIBLE_HOST_RANK = {"wasapi": 0, "directsound": 1, "mme": 2}
 
 
 def _is_mixer_endpoint(name: str) -> bool:
@@ -300,34 +317,79 @@ def _is_mixer_endpoint(name: str) -> bool:
     return any(hint in lowered for hint in _MIXER_ENDPOINT_HINTS)
 
 
+def _is_sound_mapper(name: str) -> bool:
+    """True for the MME/DirectSound routing pseudo-devices, not a real microphone."""
+    lowered = name.casefold()
+    return any(hint in lowered for hint in _PSEUDO_ENDPOINT_HINTS)
+
+
 def _looks_like_microphone(name: str) -> bool:
     lowered = name.casefold()
     return any(hint in lowered for hint in _MICROPHONE_HINTS)
 
 
-def _other_hostapi_devices() -> list[int]:
-    """Non-WASAPI input indices, most likely to record voice first."""
+def _is_kernel_device(device: InputDevice) -> bool:
+    return _KERNEL_HOST_API in device.hostapi.casefold()
 
-    def rank(device: InputDevice) -> tuple[int, int]:
-        api = device.hostapi.casefold()
-        position = next(
-            (index for index, name in enumerate(_LAST_RESORT_HOST_APIS) if name in api),
-            len(_LAST_RESORT_HOST_APIS),
-        )
-        return position, 0 if _looks_like_microphone(device.name) else 1
 
+def _visible_host_rank(device: InputDevice) -> int:
+    lowered = device.hostapi.casefold()
+    for name, rank in _VISIBLE_HOST_RANK.items():
+        if name in lowered:
+            return rank
+    return len(_VISIBLE_HOST_RANK)
+
+
+def _usable_input_devices() -> list[InputDevice]:
+    """Input devices a person can actually speak into."""
+    return [
+        device
+        for device in list_input_devices()
+        if not _is_mixer_endpoint(device.name) and not _is_sound_mapper(device.name)
+    ]
+
+
+def _mirror_hostapi_devices() -> list[int]:
+    """Non-WASAPI, non-kernel indices: the session endpoints seen from MME/DirectSound."""
+    return [
+        device.index
+        for device in _usable_input_devices()
+        if "wasapi" not in device.hostapi.casefold() and not _is_kernel_device(device)
+    ]
+
+
+def _kernel_devices() -> list[int]:
+    """WDM-KS indices — the hardware Windows does not show in the session."""
     return [
         device.index
         for device in sorted(
-            (
-                device
-                for device in list_input_devices()
-                if "wasapi" not in device.hostapi.casefold()
-                and not _is_mixer_endpoint(device.name)
-            ),
-            key=rank,
+            (device for device in _usable_input_devices() if _is_kernel_device(device)),
+            key=lambda device: 0 if _looks_like_microphone(device.name) else 1,
         )
     ]
+
+
+def visible_input_devices(*, include_kernel: bool = False) -> list[InputDevice]:
+    """One entry per recording device, the way Windows itself lists them.
+
+    Duplicates of the same endpoint seen through MME, DirectSound and WASAPI are
+    collapsed onto the WASAPI entry, and kernel-only inputs are hidden unless
+    ``include_kernel`` is set — in a remote session they belong to the machine,
+    not to the user.
+    """
+    devices = _usable_input_devices()
+    if not include_kernel:
+        devices = [device for device in devices if not _is_kernel_device(device)]
+    result: list[InputDevice] = []
+    for device in devices:
+        match = next(
+            (item for item in result if _same_device_name(item.name, device.name)), None
+        )
+        if match is None:
+            result.append(device)
+        elif _visible_host_rank(device) < _visible_host_rank(match):
+            result[result.index(match)] = device
+    return result
 
 
 def _is_server_side_fallback(device_index: Optional[int]) -> bool:
@@ -740,9 +802,12 @@ class RecordingSession:
         Audio" device. An explicitly selected device is tried first, with its
         WASAPI equivalent as a fallback. All WASAPI input devices are tried
         before that, because the default endpoint reported by PortAudio is not
-        always the one that actually carries audio. Last come the devices of the
-        other host APIs — in an RDP session those are the microphones physically
-        attached to the server, which is better than not recording at all.
+        always the one that actually carries audio. Then come the MME and
+        DirectSound views of the same session endpoints. Kernel (WDM-KS) inputs
+        are last and off by default: in a remote session they are the
+        microphones physically attached to the server, which record silence
+        from a headset hundreds of kilometres away, so they are only tried when
+        the user says the microphone really is plugged into this computer.
         """
         wasapi_devices = [
             device.index
@@ -769,8 +834,11 @@ class RecordingSession:
                 add(index)
             add(device_index)
             add(_system_default_input())
-        for index in _other_hostapi_devices():
+        for index in _mirror_hostapi_devices():
             add(index)
+        if self.cfg.server_microphone:
+            for index in _kernel_devices():
+                add(index)
         if not ordered:
             ordered.append(None)
         return ordered
@@ -1227,6 +1295,7 @@ def _verdict_lines(
     redirect_seen: bool,
     mf_text: str,
     blockers: list[str],
+    server_microphone: bool,
 ) -> list[str]:
     """Say in plain words what the device table means, so the user knows what to fix."""
     lines = ["== Вывод =="]
@@ -1243,10 +1312,12 @@ def _verdict_lines(
             "в клиенте RDP «Локальные ресурсы» → «Звук» → «Параметры» → «Запись с "
             "этого компьютера» = «Этот компьютер» (в .rdp-файле audiocapturemode:i:1)."
         )
-        if opened:
+        if local_opened:
             lines.append(
-                "  С микрофона, подключённого к серверу, запись доступна: "
-                + "; ".join((local_opened or opened)[:3])
+                "  Микрофоны, подключённые к серверу, открываются: "
+                + "; ".join(local_opened[:3])
+                + " — говорить в них полезно только физически находясь у этого "
+                "компьютера, поэтому по умолчанию приложение их не использует."
             )
         return lines
     if failed_redirect and not opened:
@@ -1282,10 +1353,18 @@ def _verdict_lines(
         )
         if local_opened:
             lines.append(
-                "  До настройки перенаправления приложение будет записывать с "
-                "микрофона сервера: "
+                "  Микрофоны, подключённые к серверу, открываются ("
                 + "; ".join(local_opened[:3])
-                + " — говорить нужно в него."
+                + "), но это устройства самого компьютера"
+                + (
+                    "; настройка «микрофон подключён к этому компьютеру» включена, "
+                    "и приложение попробует их — если гарнитура не вставлена в этот "
+                    "ПК, запись будет молчать."
+                    if server_microphone
+                    else " — приложение их не открывает. Включите настройку "
+                    "«микрофон подключён физически к этому компьютеру», только если "
+                    "гарнитура действительно в него вставлена."
+                )
             )
         return lines
     if opened:
@@ -1312,6 +1391,8 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         f"Сеанс RDP: {'да' if is_remote_session() else 'нет'}",
         f"Частота из настроек: {int(cfg.sample_rate)} Гц",
         f"Микрофон из настроек: {cfg.input_device or 'системный по умолчанию'}",
+        "Гарнитура подключена к этому компьютеру: "
+        + ("да" if cfg.server_microphone else "нет"),
         "",
     ]
     if not HAS_SOUNDDEVICE:
@@ -1322,6 +1403,11 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
     devices = list_input_devices()
     default = default_input_device()
     lines.append(f"Микрофонов найдено: {len(devices)}")
+    lines.append(
+        "Сколько из них приложение считает устройствами сеанса "
+        "(столько же в списке настроек): "
+        f"{len(visible_input_devices(include_kernel=bool(cfg.server_microphone)))}"
+    )
     lines.append(f"Системный по умолчанию: {default.label() if default else 'не определён'}")
     wasapi_default = _wasapi_default_input()
     lines.append(
@@ -1359,7 +1445,14 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
     for device in devices:
         redirected = _is_redirected_endpoint(device.name)
         redirect_seen = redirect_seen or redirected
-        lines.append(f"[{device.index}] {device.label()} | каналов: {device.channels}")
+        lines.append(
+            f"[{device.index}] {device.label()} | каналов: {device.channels}"
+            + (
+                " | устройство ядра, вне аудиодвижка сеанса"
+                if _is_kernel_device(device)
+                else ""
+            )
+        )
         wasapi = "wasapi" in device.hostapi.casefold()
         modes = (False, True) if wasapi else (False,)
         device_ok = False
@@ -1426,6 +1519,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
             redirect_seen=redirect_seen,
             mf_text="\n".join(mf_lines),
             blockers=blockers,
+            server_microphone=bool(cfg.server_microphone),
         )
     )
     lines.append("")

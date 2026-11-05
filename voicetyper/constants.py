@@ -3,7 +3,7 @@
 APP_ID = "VoiceTyper"
 APP_NAME = "VoiceTyper"
 APP_TITLE = "Voice Typer"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 CONFIG_VERSION = 3
 HISTORY_VERSION = 1
 
@@ -151,7 +151,7 @@ TONE_FILES = ("model.onnx", "kenlm.bin")
 TONE_DECODERS = ("auto", "beam_search", "greedy")
 DEVICES = ("auto", "cpu", "cuda")
 COMPUTE_TYPES = ("auto", "int8", "int8_float16", "float16", "float32")
-INSERT_MODES = ("paste", "clipboard", "type")
+INSERT_MODES = ("paste", "clipboard", "type", "type_scancode")
 HOTKEY_MODES = ("hold", "toggle")
 
 # Status codes shared by the tray, pipeline and notifications.

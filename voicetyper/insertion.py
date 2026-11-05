@@ -96,6 +96,12 @@ def _user32():
         user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
         user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
         user32.GetClipboardSequenceNumber.argtypes = []
+        user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+        user32.GetKeyboardLayout.restype = ctypes.c_void_p
+        user32.VkKeyScanExW.argtypes = [wintypes.WCHAR, ctypes.c_void_p]
+        user32.VkKeyScanExW.restype = ctypes.c_short
+        user32.MapVirtualKeyExW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+        user32.MapVirtualKeyExW.restype = wintypes.UINT
         return user32
     except Exception:
         logger.debug("user32 недоступен", exc_info=True)
@@ -254,6 +260,144 @@ def _send_paste() -> None:
         keyboard.press_and_release("ctrl+v")
 
 
+# ---------------------------------------------------------------------------
+# Scan-code typing
+#
+# SendInput with wScan == 0 produces WM_KEYDOWN/WM_CHAR locally, but the Remote
+# Desktop client only forwards events that carry a real hardware scan code, so
+# keystrokes injected into an RDP session have to emulate physical keys and let
+# the remote layout translate them. That is also why no clipboard is touched.
+# ---------------------------------------------------------------------------
+_VK_SHIFT = 0x10
+_VK_RETURN = 0x0D
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_KEYEVENTF_UNICODE = 0x0004
+_MAPVK_VK_TO_VSC = 0
+_MAPVK_VK_TO_VSC_EX = 4
+_STATE_SHIFT = 0x01
+_STATE_CTRL = 0x02
+_STATE_ALT = 0x04
+_LEFT_SHIFT_SCAN = 42
+_KEY_CACHE: dict[tuple[Optional[int], str], Optional[tuple[int, int, int, bool]]] = {}
+
+
+def _active_keyboard_layout(user32) -> Optional[int]:
+    """Layout of the window that would receive the keystrokes."""
+    try:
+        hkl = user32.GetKeyboardLayout(0)
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if hwnd:
+            thread_id = int(user32.GetWindowThreadProcessId(hwnd, None))
+            if thread_id:
+                hkl = user32.GetKeyboardLayout(thread_id) or hkl
+        return int(hkl) if hkl else None
+    except Exception:
+        logger.debug("Не удалось определить раскладку клавиатуры", exc_info=True)
+        return None
+
+
+def _key_for(char: str, hkl: Optional[int], user32) -> Optional[tuple[int, int, int, bool]]:
+    """(wVk, wScan, flags, needs_shift) for ``char``, or None if it has no key.
+
+    Cached per layout because the Win32 lookups are called once per character of
+    a potentially long dictation.
+    """
+    cache_key = (hkl, char)
+    if cache_key in _KEY_CACHE:
+        return _KEY_CACHE[cache_key]
+    result: Optional[tuple[int, int, int, bool]] = None
+    try:
+        if char == "\n":
+            scan = int(user32.MapVirtualKeyExW(_VK_RETURN, _MAPVK_VK_TO_VSC, hkl))
+            if scan:
+                result = (_VK_RETURN, scan, 0, False)
+        else:
+            mapped = int(user32.VkKeyScanExW(char, hkl))
+            # -1 means "no key produces this character" (dead keys, emoji).
+            if mapped >= 0:
+                vk = mapped & 0xFF
+                state = (mapped >> 8) & 0xFF
+                if not state & (_STATE_CTRL | _STATE_ALT):
+                    scan = int(user32.MapVirtualKeyExW(vk, _MAPVK_VK_TO_VSC, hkl))
+                    flags = 0
+                    if not scan:
+                        extended = int(user32.MapVirtualKeyExW(vk, _MAPVK_VK_TO_VSC_EX, hkl))
+                        scan = extended & 0xFFFF
+                        if extended & 0xFF000000:
+                            flags = _KEYEVENTF_EXTENDEDKEY
+                    if scan:
+                        result = (vk, scan, flags, bool(state & _STATE_SHIFT))
+    except Exception:
+        logger.debug("Не удалось подобрать клавишу для %r", char, exc_info=True)
+    _KEY_CACHE[cache_key] = result
+    return result
+
+
+def _send_events(user32, events: list[tuple[int, int, int]]) -> bool:
+    if not events:
+        return True
+    try:
+        batch = (_INPUT * len(events))()
+        for event, (vk, scan, flags) in zip(batch, events, strict=True):
+            event.type = _INPUT_KEYBOARD
+            event.union.ki.wVk = vk
+            event.union.ki.wScan = scan
+            event.union.ki.dwFlags = flags
+        sent = int(user32.SendInput(len(batch), batch, ctypes.sizeof(_INPUT)))
+        return sent == len(events)
+    except Exception:
+        logger.debug("SendInput не сработал", exc_info=True)
+        return False
+
+
+def _unicode_events(char: str) -> list[tuple[int, int, int]]:
+    """Events for characters with no key on the current layout.
+
+    RDP drops events without a scan code, so this only helps locally; recording
+    nothing at all would be worse.
+    """
+    units = char.encode("utf-16-le")
+    events: list[tuple[int, int, int]] = []
+    for offset in range(0, len(units), 2):
+        code = int.from_bytes(units[offset : offset + 2], "little")
+        events.append((0, code, _KEYEVENTF_UNICODE))
+        events.append((0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
+    return events
+
+
+def type_scancodes(text: str, *, delay_ms: int = 12) -> bool:
+    """Type ``text`` as physical keystrokes; returns False when Win32 is absent."""
+    user32 = _user32()
+    if user32 is None:
+        return False
+    hkl = _active_keyboard_layout(user32)
+    shift_scan = _LEFT_SHIFT_SCAN
+    try:
+        shift_scan = int(user32.MapVirtualKeyExW(_VK_SHIFT, _MAPVK_VK_TO_VSC, hkl)) or shift_scan
+    except Exception:
+        logger.debug("Не удалось определить скан-код Shift", exc_info=True)
+    delay = max(0, int(delay_ms)) / 1000.0
+
+    for char in text:
+        key = _key_for(char, hkl, user32)
+        if key is None:
+            events = _unicode_events(char)
+        else:
+            vk, scan, flags, needs_shift = key
+            events = []
+            if needs_shift:
+                events.append((_VK_SHIFT, shift_scan, 0))
+            events.append((vk, scan, flags))
+            events.append((vk, scan, flags | _KEYEVENTF_KEYUP))
+            if needs_shift:
+                events.append((_VK_SHIFT, shift_scan, _KEYEVENTF_KEYUP))
+        if not _send_events(user32, events):
+            return False
+        if delay:
+            time.sleep(delay)
+    return True
+
+
 def _copy(text: str) -> None:
     if not HAS_PYPERCLIP:
         raise InsertionError("pyperclip не установлен — вставка невозможна")
@@ -317,6 +461,21 @@ def insert_text(
             return InsertionResult(method="type", inserted=True, target_focused=focused)
         except Exception as exc:
             return InsertionResult(method="type", target_focused=focused, error=f"Ошибка ввода: {exc}")
+
+    if cfg.insert_mode == "type_scancode":
+        try:
+            typed = type_scancodes(text, delay_ms=cfg.type_delay_ms)
+        except Exception as exc:
+            return InsertionResult(
+                method="type_scancode", target_focused=focused, error=f"Ошибка ввода: {exc}"
+            )
+        if not typed:
+            return InsertionResult(
+                method="type_scancode",
+                target_focused=focused,
+                error="Win32 SendInput недоступен — текст не введён",
+            )
+        return InsertionResult(method="type_scancode", inserted=True, target_focused=focused)
 
     old_text = _read_clipboard_text()
     try:

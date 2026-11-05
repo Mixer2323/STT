@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import paths
-from .audio import HAS_SOUNDDEVICE, list_input_devices, refresh_input_devices
+from .audio import HAS_SOUNDDEVICE, refresh_input_devices, visible_input_devices
 from .config import ConfigStore
 from .constants import (
     APP_TITLE,
@@ -382,6 +382,25 @@ class SettingsWindow:
         )
         self.vars["max_recording_seconds"] = tk.StringVar()
         self._spin_row(hotkey_box, 4, "Максимум записи, с", self.vars["max_recording_seconds"], 10, 3600)
+        self.vars["server_microphone"] = tk.BooleanVar()
+        ttk.Checkbutton(
+            hotkey_box,
+            text="Гарнитура подключена физически к этому компьютеру",
+            variable=self.vars["server_microphone"],
+            command=self._on_server_mic_toggled,
+        ).grid(row=5, column=1, sticky="w", pady=2)
+        ttk.Label(
+            hotkey_box,
+            text=(
+                "В сеансе RDP Windows показывает только «Удаленное аудио» — микрофон "
+                "вашего домашнего компьютера. Физические входы самого сервера приложение "
+                "не использует, иначе оно молчит, пока вы говорите в гарнитуру в другом "
+                "месте. Отметьте этот пункт, только если гарнитура воткнута в тот "
+                "компьютер, где запущен Voice Typer."
+            ),
+            style="Hint.TLabel",
+            wraplength=int(480 * self._scale),
+        ).grid(row=6, column=1, sticky="w", pady=(0, 6))
 
         engine_box = ttk.LabelFrame(frame, text="Распознавание", padding=10)
         engine_box.pack(fill="x")
@@ -469,6 +488,12 @@ class SettingsWindow:
             ("paste", "Вставить через Ctrl+V", "Буфер обмена восстанавливается после вставки"),
             ("clipboard", "Только скопировать", "Текст остаётся в буфере обмена, вставьте вручную"),
             ("type", "Напечатать", "Медленнее и хуже для длинного текста"),
+            (
+                "type_scancode",
+                "Напечатать скан-кодами (без буфера обмена)",
+                "Клавиши передаются в сеанс RDP даже при запрещённом буфере обмена; "
+                "медленнее Ctrl+V",
+            ),
         ):
             ttk.Radiobutton(
                 box, text=label, value=value, variable=self.vars["insert_mode"]
@@ -492,18 +517,20 @@ class SettingsWindow:
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["paste_delay_ms"] = tk.StringVar()
         self._spin_row(options, 2, "Задержка перед Ctrl+V, мс", self.vars["paste_delay_ms"], 0, 2000)
+        self.vars["type_delay_ms"] = tk.StringVar()
+        self._spin_row(options, 3, "Задержка между клавишами, мс", self.vars["type_delay_ms"], 0, 500)
         self.vars["trim_silence"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Обрезать тишину в начале и конце", variable=self.vars["trim_silence"]
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["capitalize"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Начинать предложения с заглавной буквы", variable=self.vars["capitalize"]
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["remove_fillers"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Удалять слова-заполнители (ээ, эм, uh, um, «ну,», «это самое»)", variable=self.vars["remove_fillers"]
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
 
         exclude = ttk.LabelFrame(frame, text="Фразы-исключения", padding=10)
         exclude.pack(fill="both", expand=True)
@@ -801,6 +828,8 @@ class SettingsWindow:
         cfg = self._store.get()
         self._loading = True
         try:
+            # The device list depends on this flag, so set it before refreshing.
+            self.vars["server_microphone"].set(cfg.server_microphone)
             self._refresh_devices()
             self.vars["hotkey"].set(cfg.hotkey)
             self.vars["hotkey_mode"].set(_HOTKEY_MODE_LABELS.get(cfg.hotkey_mode, "Удержание"))
@@ -822,6 +851,7 @@ class SettingsWindow:
             self.vars["restore_clipboard"].set(cfg.restore_clipboard)
             self.vars["restore_target_window"].set(cfg.restore_target_window)
             self.vars["paste_delay_ms"].set(str(cfg.paste_delay_ms))
+            self.vars["type_delay_ms"].set(str(cfg.type_delay_ms))
             self.vars["trim_silence"].set(cfg.trim_silence)
             self.vars["capitalize"].set(cfg.capitalize)
             self.vars["remove_fillers"].set(cfg.remove_fillers)
@@ -846,7 +876,12 @@ class SettingsWindow:
         # when the client connects, so re-enumerate before showing the list.
         if not getattr(self._app, "is_recording", False):
             refresh_input_devices()
-        self._devices = list_input_devices()
+        # Kernel (WDM-KS) inputs are not what Windows shows in the session, so
+        # they only belong in the list when the user says the headset really is
+        # plugged into this computer.
+        variable = self.vars.get("server_microphone")
+        include_kernel = bool(variable.get()) if variable is not None else False
+        self._devices = visible_input_devices(include_kernel=include_kernel)
         self._device_labels = ["Системный по умолчанию"]
         self._device_values = [None]
         for device in self._devices:
@@ -865,6 +900,11 @@ class SettingsWindow:
             self.device_combo.configure(textvariable=self.vars["input_device"])
         if self.vars["input_device"].get() not in self._device_labels:
             self.device_combo.set(self._device_labels[0])
+
+    def _on_server_mic_toggled(self) -> None:
+        if self._loading:
+            return
+        self._refresh_devices()
 
     def _select_input_device(self, value) -> None:
         try:
@@ -1139,10 +1179,12 @@ class SettingsWindow:
                     "max_recording_seconds", "Максимум записи", 10, 3600
                 ),
                 input_device=device_index,
+                server_microphone=bool(self.vars["server_microphone"].get()),
                 insert_mode=self.vars["insert_mode"].get(),
                 restore_clipboard=bool(self.vars["restore_clipboard"].get()),
                 restore_target_window=bool(self.vars["restore_target_window"].get()),
                 paste_delay_ms=self._int_value("paste_delay_ms", "Задержка вставки", 0, 2000),
+                type_delay_ms=self._int_value("type_delay_ms", "Задержка между клавишами", 0, 500),
                 trim_silence=bool(self.vars["trim_silence"].get()),
                 capitalize=bool(self.vars["capitalize"].get()),
                 remove_fillers=bool(self.vars["remove_fillers"].get()),

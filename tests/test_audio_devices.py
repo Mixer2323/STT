@@ -188,7 +188,7 @@ def _field_machine() -> list[dict]:
     ]
 
 
-def test_wdm_microphones_come_after_the_wasapi_endpoint(
+def test_kernel_devices_are_left_out_of_the_queue_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
@@ -197,13 +197,26 @@ def test_wdm_microphones_come_after_the_wasapi_endpoint(
 
     candidates = audio.RecordingSession(Config())._candidate_devices(1)
 
-    assert candidates[0] == 9
+    assert candidates == [9, 1, 5]
+
+
+def test_kernel_devices_join_the_queue_only_when_the_headset_is_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    candidates = audio.RecordingSession(
+        Config(server_microphone=True)
+    )._candidate_devices(1)
+
+    assert candidates[:3] == [9, 1, 5]
     assert candidates.index(10) < candidates.index(14) < candidates.index(11)
-    assert candidates.index(11) < candidates.index(5)
     assert 12 not in candidates
 
 
-def test_start_records_from_the_server_mic_when_rdp_refuses(
+def test_start_refuses_the_server_mic_in_an_rdp_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
@@ -212,12 +225,75 @@ def test_start_records_from_the_server_mic_when_rdp_refuses(
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
     monkeypatch.setattr(audio, "is_remote_session", lambda: True)
 
-    session = audio.RecordingSession(Config())
+    with pytest.raises(audio.AudioError):
+        audio.RecordingSession(Config()).start()
+
+
+def test_start_records_from_the_server_mic_when_the_option_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    fake.failing_devices = {1, 5, 9}
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+
+    session = audio.RecordingSession(Config(server_microphone=True))
     session.start()
 
     assert session.is_recording
     assert fake.opened[-1][0] in (10, 14)
     session.stop()
+
+
+def test_visible_devices_collapse_the_host_api_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    devices = audio.visible_input_devices()
+
+    assert [device.index for device in devices] == [9]
+    assert [device.index for device in audio.visible_input_devices(include_kernel=True)] == [
+        9,
+        10,
+        11,
+        14,
+    ]
+
+
+def test_visible_devices_hide_mixers_and_the_sound_mapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices_data = [
+        _device(0, "Microsoft Sound Mapper - Input", hostapi=0),
+        _device(1, "Переназначение звуковых устр-", hostapi=0),
+        _device(2, "Микрофон (USB Headset)", hostapi=0),
+        _device(3, "Стерео микшер", hostapi=0),
+        _device(4, "Микрофон (USB Headset)", hostapi=1),
+        _device(8, "Первичный драйвер записи звука", hostapi=2),
+    ]
+    fake = FakeSoundDevice(devices_data, default_index=0, wasapi_default=4)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    assert [device.index for device in audio.visible_input_devices()] == [4]
+
+
+def test_device_names_stay_on_one_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeSoundDevice(
+        [_device(1, "Вход (bthhfenum.sys,#4;%1 Hands-Free%0\r\n;(Phone))", hostapi=1)],
+        default_index=1,
+        wasapi_default=1,
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    assert audio.visible_input_devices()[0].name == (
+        "Вход (bthhfenum.sys,#4;%1 Hands-Free%0 ;(Phone))"
+    )
 
 
 def test_server_side_device_is_not_reported_as_fallback_locally(
@@ -243,12 +319,28 @@ def test_verdict_blames_the_client_when_the_endpoint_exists_but_refuses() -> Non
         redirect_seen=True,
         mf_text="Initialize [формат устройства]: HRESULT 0x80070057 (E_INVALIDARG)",
         blockers=[],
+        server_microphone=False,
     )
 
     report = "\n".join(lines)
     assert "IAudioClient::Initialize возвращает E_INVALIDARG" in report
     assert "Проверять нужно клиент, а не сервер" in report
-    assert "записывать с микрофона сервера" in report
+    assert "приложение их не открывает" in report
+
+
+def test_verdict_warns_when_the_local_only_devices_are_enabled() -> None:
+    lines = audio._verdict_lines(
+        is_rdp=True,
+        opened=["[14] Микрофон (Logi USB Headset H340)"],
+        failed_redirect=["[9] Удаленное аудио"],
+        local_opened=["[14] Микрофон (Logi USB Headset H340)"],
+        redirect_seen=True,
+        mf_text="",
+        blockers=[],
+        server_microphone=True,
+    )
+
+    assert "запись будет молчать" in "\n".join(lines)
 
 
 def test_verdict_names_absent_redirect_as_client_request() -> None:
@@ -260,6 +352,7 @@ def test_verdict_names_absent_redirect_as_client_request() -> None:
         redirect_seen=False,
         mf_text="",
         blockers=[],
+        server_microphone=False,
     )
 
     report = "\n".join(lines)
