@@ -212,13 +212,16 @@ T-one и Faster-Whisper скачиваются с Hugging Face.
 ## Командная строка
 
 ```text
-VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--verbose] [--version]
+VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--audio-test] [--verbose] [--version]
 ```
 
 - `--settings` — открыть настройки при запуске;
 - `--minimized` — не открывать настройки при первом запуске;
 - `--diagnostics` — напечатать отчёт и сохранить его в `diagnostics\`, не
   запуская приложение;
+- `--audio-test` — по очереди открыть все микрофоны (WASAPI в общем и
+  монопольном режиме) и сохранить отчёт `audio-test_*.txt` в `diagnostics\`,
+  не запуская приложение;
 - `--verbose` — подробные логи;
 - `--version` — версия.
 

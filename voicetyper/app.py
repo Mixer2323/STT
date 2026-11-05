@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import paths, single_instance
-from .audio import AudioError, RecordingSession
+from .audio import AudioError, RecordingSession, probe_input_devices
 from .autostart import is_enabled as autostart_is_enabled
 from .autostart import is_supported as autostart_supported
 from .autostart import set_enabled as set_autostart_enabled
@@ -796,6 +796,11 @@ def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         action="store_true",
         help="напечатать диагностику и сохранить её в файл, не запуская приложение",
     )
+    parser.add_argument(
+        "--audio-test",
+        action="store_true",
+        help="проверить все микрофоны и сохранить отчёт в файл, не запуская приложение",
+    )
     parser.add_argument("--verbose", action="store_true", help="подробное логирование")
     parser.add_argument("--version", action="store_true", help="показать версию")
     return parser.parse_args(argv)
@@ -808,6 +813,19 @@ def _fatal(message: str) -> None:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(None, message, APP_TITLE, 0x10)
+        except Exception:
+            pass
+
+
+def _report_saved(destination: Path, title: str) -> None:
+    """Announce a saved report, visibly when running as a windowed exe."""
+    message = f"{title} сохранена в файл:\n{destination}\n\nОтправьте этот файл разработчику."
+    print(message)
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, APP_TITLE, 0x40)
         except Exception:
             pass
 
@@ -828,6 +846,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.warning("Конфигурация: %s", warning)
     cfg = store.get()
 
+    if args.audio_test:
+        try:
+            text = probe_input_devices(cfg)
+            destination = write_diagnostics(text, prefix="audio-test")
+        except Exception as exc:
+            logger.exception("Ошибка проверки микрофонов")
+            _fatal(f"Не удалось проверить микрофоны:\n{exc}")
+            return 1
+        _report_saved(destination, "Проверка микрофонов")
+        return 0
+
     if args.diagnostics:
         history = HistoryStore(
             paths.history_path(),
@@ -839,11 +868,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             text = collect_diagnostics(store, models, history)
             print(text)
             destination = write_diagnostics(text)
-            print(f"\nСохранено: {destination}")
         except Exception as exc:
             logger.exception("Ошибка диагностики")
-            print(f"Не удалось собрать диагностику: {exc}", file=sys.stderr)
+            _fatal(f"Не удалось собрать диагностику:\n{exc}")
             return 1
+        _report_saved(destination, "Диагностика")
         return 0
 
     instance = None

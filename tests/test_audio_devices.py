@@ -37,6 +37,7 @@ class FakeSoundDevice:
         wasapi_default=None,
         failing=None,
         failing_devices=None,
+        shared_fail_devices=None,
         fail_until_refresh=None,
     ):
         self._devices = devices
@@ -44,8 +45,10 @@ class FakeSoundDevice:
         self.wasapi_default = wasapi_default
         self.failing = failing or set()
         self.failing_devices = failing_devices or set()
+        self.shared_fail_devices = shared_fail_devices or set()
         self.fail_until_refresh = fail_until_refresh
         self.opened: list[tuple[object, int, int]] = []
+        self.exclusive_opened: list[tuple[object, int, int]] = []
         self.refreshed = 0
 
     def query_hostapis(self):
@@ -84,15 +87,33 @@ class FakeSoundDevice:
                 return item
         raise ValueError(f"Invalid device: {device}")
 
-    def InputStream(self, *, device, samplerate, channels, dtype, blocksize, callback):
-        self.opened.append((device, samplerate, channels))
+    def InputStream(
+        self,
+        *,
+        device,
+        samplerate,
+        channels,
+        dtype,
+        blocksize,
+        callback,
+        extra_settings=None,
+    ):
+        exclusive = extra_settings is not None
+        if exclusive:
+            self.exclusive_opened.append((device, samplerate, channels))
+        else:
+            self.opened.append((device, samplerate, channels))
+        if self.fail_until_refresh is not None and self.refreshed == 0:
+            raise RuntimeError("Error opening InputStream: MME error 11")
         if not self._devices:
             raise RuntimeError("Error opening InputStream: no input device")
         if device in self.failing_devices:
             raise RuntimeError("Error opening InputStream: MME error 11")
+        if exclusive and device in self.shared_fail_devices:
+            return FakeStream(device, samplerate, channels)
+        if not exclusive and device in self.shared_fail_devices:
+            raise RuntimeError("Error opening InputStream: shared mode refused")
         if samplerate in self.failing:
-            raise RuntimeError("Error opening InputStream: MME error 11")
-        if self.fail_until_refresh is not None and self.refreshed == 0:
             raise RuntimeError("Error opening InputStream: MME error 11")
         return FakeStream(device, samplerate, channels)
 
@@ -101,6 +122,10 @@ class FakeSoundDevice:
 
     def _initialize(self):
         pass
+
+    @staticmethod
+    def WasapiSettings(exclusive=False):
+        return SimpleNamespace(exclusive=exclusive)
 
 
 def _device(
@@ -196,8 +221,9 @@ def test_wasapi_is_preferred_for_default_device(monkeypatch: pytest.MonkeyPatch)
     session = audio.RecordingSession(Config())
     session.start()
 
-    assert fake.opened[0] == (2, 48000, 1)
+    assert fake.opened[0] == (2, 48000, 2)
     assert session.capture_rate == 48000
+    assert session._capture_channels == 2
     assert session._stream.device == 2
     session.stop()
 
@@ -222,3 +248,70 @@ def test_explicit_device_falls_back_to_wasapi_equivalent(
     assert fake.opened[-1][0] == 2
     assert session._stream.device == 2
     session.stop()
+
+
+def test_wasapi_tries_stereo_before_mono(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [_device(2, "Удалённое аудио", hostapi=1, channels=1, rate=48000.0)]
+    fake = FakeSoundDevice(devices, default_index=2, wasapi_default=2)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert fake.opened[0] == (2, 48000, 2)
+    session.stop()
+
+
+def test_wasapi_exclusive_mode_is_the_last_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [_device(2, "Удалённое аудио", hostapi=1, channels=1, rate=48000.0)]
+    fake = FakeSoundDevice(
+        devices,
+        default_index=2,
+        wasapi_default=2,
+        shared_fail_devices={2},
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert fake.exclusive_opened
+    assert fake.exclusive_opened[0][0] == 2
+    assert session._stream.device == 2
+    session.stop()
+
+
+def test_all_wasapi_devices_are_tried(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [
+        _device(1, "Микрофон (USB)", hostapi=0),
+        _device(2, "Микрофон (USB)", hostapi=1),
+        _device(3, "Удалённое аудио", hostapi=1),
+    ]
+    fake = FakeSoundDevice(
+        devices, default_index=1, wasapi_default=2, failing_devices={1, 2}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert session._stream.device == 3
+    session.stop()
+
+
+def test_probe_input_devices_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [_device(2, "Удалённое аудио", hostapi=1, channels=1, rate=48000.0)]
+    fake = FakeSoundDevice(devices, default_index=2, wasapi_default=2)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    report = audio.probe_input_devices(Config())
+
+    assert "Voice Typer" in report
+    assert "[2] Удалённое аудио" in report
+    assert "shared: OK" in report

@@ -113,10 +113,10 @@ def collect_diagnostics(
     return "\n".join(lines)
 
 
-def write_diagnostics(text: str) -> Path:
+def write_diagnostics(text: str, *, prefix: str = "diagnostics") -> Path:
     directory = paths.diagnostics_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / f"diagnostics_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    destination = directory / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.txt"
     destination.write_text(text + "\n", encoding="utf-8")
     return destination
 
