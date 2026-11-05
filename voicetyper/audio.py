@@ -37,6 +37,20 @@ except Exception:
     HAS_SOUNDFILE = False
 
 try:
+    import soundcard as sc
+
+    HAS_SOUNDCARD = True
+except Exception:
+    sc = None
+    HAS_SOUNDCARD = False
+
+try:
+    from .native_audio import HAS_MEDIA_FOUNDATION, open_recorder
+except Exception:
+    HAS_MEDIA_FOUNDATION = False
+    open_recorder = None
+
+try:
     import audioop
 
     HAS_AUDIOOP = True
@@ -305,6 +319,40 @@ def _format_candidates(device_index: Optional[int], requested: int) -> list[tupl
     return formats
 
 
+def _soundcard_microphones() -> list[object]:
+    if not HAS_SOUNDCARD or os.name != "nt":
+        return []
+    try:
+        return list(sc.all_microphones(include_loopback=False))
+    except Exception:
+        logger.debug("Не удалось перечислить микрофоны Windows Media Foundation", exc_info=True)
+        return []
+
+
+def _find_soundcard_microphone(names: list[str]) -> Optional[object]:
+    """Pick a Media Foundation microphone matching one of ``names``."""
+    if not HAS_SOUNDCARD or os.name != "nt":
+        return None
+    microphones = _soundcard_microphones()
+    if not microphones:
+        return None
+    wanted = [name.strip() for name in names if name and name.strip()]
+    for name in wanted:
+        for microphone in microphones:
+            microphone_name = str(getattr(microphone, "name", ""))
+            if not microphone_name:
+                continue
+            if _same_device_name(microphone_name, name):
+                return microphone
+            if name.casefold() in microphone_name.casefold():
+                return microphone
+    try:
+        return sc.default_microphone()
+    except Exception:
+        logger.debug("Не удалось выбрать микрофон по умолчанию", exc_info=True)
+        return None
+
+
 def resolve_input_device(value: int | str | None) -> Optional[int]:
     """Map a config value (index or name) to a sounddevice index.
 
@@ -542,6 +590,10 @@ class RecordingSession:
         self._auto_stop_fired = False
         self._last_level_at = 0.0
         self._overflowed = False
+        self._native_thread: Optional[threading.Thread] = None
+        self._native_stop: Optional[threading.Event] = None
+        self._native_error: Optional[BaseException] = None
+        self._native_mic_name = ""
 
     @property
     def is_recording(self) -> bool:
@@ -654,6 +706,7 @@ class RecordingSession:
                 exclusive_modes = [False]
                 if candidate is not None and _is_wasapi_index(candidate):
                     exclusive_modes.append(True)
+                candidate_error: Optional[BaseException] = None
                 for exclusive in exclusive_modes:
                     for rate, channels in self._candidate_formats(candidate):
                         try:
@@ -662,6 +715,7 @@ class RecordingSession:
                             )
                         except Exception as exc:
                             last_error = exc
+                            candidate_error = exc
                             logger.debug(
                                 "Не удалось открыть микрофон (%s, %d Гц, %d кан., %s): %s",
                                 candidate if candidate is not None else "default",
@@ -684,6 +738,12 @@ class RecordingSession:
                             "exclusive" if exclusive else "shared",
                         )
                         return stream, rate, channels, candidate
+                logger.warning(
+                    "Микрофон %s (%s) не открылся: %s",
+                    candidate if candidate is not None else "default",
+                    _hostapi_name(candidate) or "default host API",
+                    candidate_error,
+                )
 
         if not list_input_devices():
             raise AudioError(_no_input_device_message())
@@ -694,13 +754,170 @@ class RecordingSession:
         )
         raise AudioError(_open_microphone_message(last_error))
 
+    def _native_capture_names(self, device_index: Optional[int]) -> list[str]:
+        names: list[str] = []
+        for index in self._candidate_devices(device_index):
+            if index is None:
+                continue
+            try:
+                name = str(sd.query_devices(index, "input").get("name", ""))
+            except Exception:
+                continue
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _start_native_capture(self) -> bool:
+        """Fall back to Windows Media Foundation capture.
+
+        PortAudio's WASAPI backend refuses to open some virtual endpoints,
+        notably the RDP "Remote Audio" device, even though Media Foundation —
+        the stack Windows applications use — records from it without problems.
+        """
+        if not HAS_SOUNDCARD or not HAS_MEDIA_FOUNDATION or os.name != "nt":
+            return False
+        device_index = resolve_input_device(self.cfg.input_device)
+        microphone = _find_soundcard_microphone(self._native_capture_names(device_index))
+        if microphone is None:
+            logger.warning("Windows Media Foundation не нашёл ни одного микрофона")
+            return False
+
+        stop_event = threading.Event()
+        ready = threading.Event()
+        self._native_stop = stop_event
+        self._native_error = None
+        self._capture_rate = int(self.cfg.sample_rate)
+        self._capture_channels = 1
+        self._native_mic_name = str(getattr(microphone, "name", "default"))
+        thread = threading.Thread(
+            target=self._native_capture_loop,
+            args=(microphone, stop_event, ready),
+            name="native-audio-capture",
+            daemon=True,
+        )
+        self._native_thread = thread
+        thread.start()
+        if not ready.wait(timeout=10.0):
+            logger.warning("Windows Media Foundation не успел открыть микрофон")
+            stop_event.set()
+            self._native_thread = None
+            return False
+        if self._native_error is not None:
+            logger.warning(
+                "Windows Media Foundation не смог открыть микрофон %s: %s",
+                self._native_mic_name,
+                self._native_error,
+            )
+            self._native_thread = None
+            return False
+        return True
+
+    def _native_capture_loop(
+        self,
+        microphone,
+        stop_event: threading.Event,
+        ready: threading.Event,
+    ) -> None:
+        com_initialized = False
+        try:
+            import ctypes
+
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+            com_initialized = True
+        except Exception:
+            logger.debug("Не удалось инициализировать COM в потоке записи", exc_info=True)
+
+        try:
+            with open_recorder(microphone, seconds=0.1) as recorder:
+                self._capture_rate = int(recorder.samplerate)
+                rate = self._capture_rate
+                blocksize = max(256, int(rate * 0.1))
+                ready.set()
+                while not stop_event.is_set():
+                    data = recorder.record(numframes=blocksize)
+                    if data is None or len(data) == 0:
+                        continue
+                    if getattr(data, "ndim", 1) > 1:
+                        data = data[:, 0]
+                    samples = np.clip(
+                        np.asarray(data, dtype=np.float32), -1.0, 1.0
+                    )
+                    chunk = np.rint(samples * 32767.0).astype(np.int16)
+                    with self._lock:
+                        if self._stopped:
+                            break
+                        self._chunks.append(chunk)
+                        self._frames += len(chunk)
+                        total_seconds = self._frames / max(1, self._capture_rate)
+                        should_auto_stop = (
+                            total_seconds >= self.cfg.max_recording_seconds
+                            and not self._auto_stop_fired
+                        )
+                        if should_auto_stop:
+                            self._auto_stop_fired = True
+                    if self._on_chunk is not None:
+                        try:
+                            self._on_chunk(chunk, self._capture_rate)
+                        except Exception:
+                            logger.debug("Ошибка потокового колбэка", exc_info=True)
+                    now = time.monotonic()
+                    if self._on_level is not None and now - self._last_level_at > 0.1:
+                        self._last_level_at = now
+                        try:
+                            self._on_level(
+                                peak_dbfs(chunk.astype(np.float32) / 32768.0)
+                            )
+                        except Exception:
+                            pass
+                    if should_auto_stop:
+                        logger.info(
+                            "Достигнут лимит записи %d с",
+                            self.cfg.max_recording_seconds,
+                        )
+                        target = self._on_auto_stop or (
+                            lambda session: session.stop()
+                        )
+                        threading.Thread(
+                            target=target,
+                            args=(self,),
+                            name="auto-stop-recording",
+                            daemon=True,
+                        ).start()
+        except Exception as exc:
+            self._native_error = exc
+            ready.set()
+            if not stop_event.is_set():
+                logger.warning(
+                    "Ошибка записи через Windows Media Foundation: %s", exc
+                )
+        finally:
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
     def start(self) -> None:
         if not HAS_SOUNDDEVICE:
             raise AudioError("sounddevice не установлен — запись недоступна")
         with self._lock:
             if self._started:
                 return
-            stream, rate, channels, device_index = self._open_first_available()
+            try:
+                stream, rate, channels, device_index = self._open_first_available()
+            except AudioError:
+                if not self._start_native_capture():
+                    raise
+                self._started = True
+                self._stopped = False
+                logger.info(
+                    "Запись начата через Windows Media Foundation: устройство=%s, "
+                    "%d Гц, каналов=%d",
+                    self._native_mic_name,
+                    self._capture_rate,
+                    self._capture_channels,
+                )
+                return
             self._stream = stream
             self._capture_rate = rate
             self._capture_channels = channels
@@ -763,7 +980,13 @@ class RecordingSession:
             self._stopped = True
             stream = self._stream
             self._stream = None
+            native_thread = self._native_thread
+            native_stop = self._native_stop
+            self._native_thread = None
+            self._native_stop = None
 
+        if native_stop is not None:
+            native_stop.set()
         if stream is not None:
             try:
                 stream.stop()
@@ -773,6 +996,10 @@ class RecordingSession:
                 stream.close()
             except Exception:
                 logger.debug("Ошибка закрытия потока", exc_info=True)
+        if native_thread is not None:
+            native_thread.join(timeout=5.0)
+            if native_thread.is_alive():
+                logger.warning("Поток Windows Media Foundation не завершился")
 
         with self._lock:
             if self._result is not None:
@@ -931,6 +1158,26 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 session._frames = 0
         if not device_ok:
             lines.append("    ИТОГ: устройство не открывается")
+        lines.append("")
+
+    if os.name == "nt":
+        lines.append("== Windows Media Foundation ==")
+        microphones = _soundcard_microphones()
+        if not microphones or not HAS_MEDIA_FOUNDATION:
+            lines.append("  Микрофоны не найдены или модуль soundcard недоступен")
+        else:
+            for microphone in microphones:
+                name = str(getattr(microphone, "name", "?"))
+                try:
+                    with open_recorder(microphone, seconds=0.1) as recorder:
+                        frames = max(256, int(recorder.samplerate * 0.2))
+                        data = recorder.record(numframes=frames)
+                    lines.append(
+                        f"  {name}: OK ({len(data)} отсчётов, "
+                        f"{recorder.samplerate} Гц, {recorder.sample_format})"
+                    )
+                except Exception as exc:
+                    lines.append(f"  {name}: ошибка: {exc}")
         lines.append("")
 
     lines.append(

@@ -44,6 +44,7 @@ for package in (
     "pystray",
     "PIL",
     "pyctcdecode",
+    "soundcard",
 ):
     try:
         hiddenimports += collect_submodules(package)
@@ -58,10 +59,17 @@ hiddenimports += [
     "pyperclip",
     "psutil",
     "sounddevice",
+    "soundcard",
+    "_cffi_backend",
     "soundfile",
     "numpy",
     "onnxruntime",
 ]
+
+try:
+    datas += collect_data_files("soundcard")
+except Exception:
+    pass
 
 for package in ("ctranslate2", "tokenizers", "av", "onnxruntime.capi", "PIL"):
     try:

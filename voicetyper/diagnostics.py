@@ -87,13 +87,18 @@ def collect_diagnostics(
 
     lines.append("== Аудио ==")
     try:
-        from .audio import default_input_device, list_input_devices
+        from .audio import (
+            HAS_MEDIA_FOUNDATION,
+            default_input_device,
+            list_input_devices,
+        )
 
         devices = list_input_devices()
         default = default_input_device()
         lines.append(f"Микрофонов найдено: {len(devices)}")
         lines.append(f"По умолчанию: {default.label() if default else 'не определён'}")
         lines.append(f"Выбрано в конфиге: {cfg.input_device or 'системное по умолчанию'}")
+        lines.append(f"Резервный захват Media Foundation: {_yes(HAS_MEDIA_FOUNDATION)}")
         for device in devices[:8]:
             lines.append(f"  {device.index}: {device.label()}")
     except Exception as exc:

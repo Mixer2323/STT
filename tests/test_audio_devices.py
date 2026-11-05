@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from voicetyper import audio
 from voicetyper.config import Config
+
+
+@pytest.fixture(autouse=True)
+def _disable_soundcard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the PortAudio tests away from real Media Foundation hardware."""
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", False)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", False)
 
 
 class FakeStream:
@@ -309,9 +318,59 @@ def test_probe_input_devices_reports_success(monkeypatch: pytest.MonkeyPatch) ->
     fake = FakeSoundDevice(devices, default_index=2, wasapi_default=2)
     monkeypatch.setattr(audio, "sd", fake)
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
 
     report = audio.probe_input_devices(Config())
 
     assert "Voice Typer" in report
     assert "[2] Удалённое аудио" in report
     assert "shared: OK" in report
+
+
+class FakeRecorder:
+    samplerate = 16000
+    sample_format = "float32"
+
+    def __enter__(self) -> "FakeRecorder":
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+    def record(self, numframes: int) -> np.ndarray:
+        time.sleep(0.005)
+        return np.zeros((numframes, 1), dtype=np.float32)
+
+
+class FakeMicrophone:
+    name = "Удалённое аудио"
+
+    def recorder(self, *, samplerate: int, channels: int, blocksize: int) -> FakeRecorder:
+        return FakeRecorder()
+
+
+def test_media_foundation_fallback_when_portaudio_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [_device(9, "Удалённое аудио", hostapi=1, channels=1, rate=44100.0)]
+    fake = FakeSoundDevice(
+        devices, default_index=9, wasapi_default=9, failing_devices={9}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", True)
+    monkeypatch.setattr(
+        audio, "_find_soundcard_microphone", lambda names: FakeMicrophone()
+    )
+    monkeypatch.setattr(
+        audio, "open_recorder", lambda microphone, seconds=0.1: FakeRecorder()
+    )
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert session.is_recording
+    assert session._native_thread is not None
+    assert session._native_mic_name == "Удалённое аудио"
+    session.stop()
