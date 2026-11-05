@@ -103,6 +103,13 @@ def collect_diagnostics(
             lines.append(f"  {device.index}: {device.label()}")
     except Exception as exc:
         lines.append(f"Ошибка опроса устройств: {exc}")
+    if os.name == "nt":
+        try:
+            from .capture_env import summary_lines
+
+            lines.extend(summary_lines())
+        except Exception as exc:
+            lines.append(f"Ошибка опроса окружения записи: {exc}")
     lines.append("")
 
     lines.append("== Параметры ==")

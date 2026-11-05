@@ -216,6 +216,32 @@ def test_no_devices_reports_rdp_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "RDP" in message
 
 
+def test_open_failure_prefers_the_windows_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        audio,
+        "_capture_blockers",
+        lambda: ["доступ к микрофону запрещён (HKCU microphone\\NonPackaged = Deny)."],
+    )
+
+    message = audio._open_microphone_message(RuntimeError("MME error 11"))
+
+    assert "Не удалось открыть микрофон" in message
+    assert "доступ к микрофону запрещён" in message
+
+
+def test_open_failure_falls_back_to_the_rdp_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audio, "_capture_blockers", lambda: [])
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+
+    message = audio._open_microphone_message(RuntimeError("MME error 11"))
+
+    assert "Запись с этого компьютера" in message
+
+
 def test_wasapi_is_preferred_for_default_device(monkeypatch: pytest.MonkeyPatch) -> None:
     devices = [
         _device(1, "Удалённое аудио", hostapi=0),
@@ -319,17 +345,48 @@ def test_probe_input_devices_reports_success(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(audio, "sd", fake)
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
     monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
+    monkeypatch.setattr(audio, "_capture_env_lines", lambda: ["== Ограничения записи Windows =="])
 
     report = audio.probe_input_devices(Config())
 
     assert "Voice Typer" in report
     assert "[2] Удалённое аудио" in report
     assert "shared: OK" in report
+    assert "== Ограничения записи Windows ==" in report
+
+
+def test_probe_input_devices_lists_every_refused_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [_device(9, "Удалённое аудио", hostapi=1, rate=44100.0)]
+    fake = FakeSoundDevice(devices, default_index=9, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
+    monkeypatch.setattr(audio, "_capture_env_lines", lambda: [])
+
+    def refusing_open(self, device, rate, channels, *, exclusive=False):
+        if rate in (44100, 48000):
+            raise RuntimeError("Unanticipated host error [MME error 11]")
+        raise RuntimeError("Invalid sample rate [PaErrorCode -9997]")
+
+    monkeypatch.setattr(audio.RecordingSession, "_open_stream", refusing_open)
+
+    report = audio.probe_input_devices(Config())
+
+    assert "shared: не удалось — 8 форматов:" in report
+    assert "44100 Гц/2 кан., 44100 Гц/1 кан." in report
+    assert "Unanticipated host error [MME error 11]" in report
+    assert "Invalid sample rate" in report
+    assert "ИТОГ: устройство не открывается" in report
 
 
 class FakeRecorder:
     samplerate = 16000
     sample_format = "float32"
+    _mix_channels = 1
+    opened_with = "тестовый формат"
+    attempts: list[BaseException] = []
 
     def __enter__(self) -> "FakeRecorder":
         return self
@@ -364,7 +421,9 @@ def test_media_foundation_fallback_when_portaudio_fails(
         audio, "_find_soundcard_microphone", lambda names: FakeMicrophone()
     )
     monkeypatch.setattr(
-        audio, "open_recorder", lambda microphone, seconds=0.1: FakeRecorder()
+        audio,
+        "open_recorder",
+        lambda microphone, seconds=0.1, preferred_rate=16000: FakeRecorder(),
     )
 
     session = audio.RecordingSession(Config())

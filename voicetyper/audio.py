@@ -45,10 +45,15 @@ except Exception:
     HAS_SOUNDCARD = False
 
 try:
-    from .native_audio import HAS_MEDIA_FOUNDATION, open_recorder
+    from .native_audio import (
+        HAS_MEDIA_FOUNDATION,
+        open_recorder,
+        probe_microphone,
+    )
 except Exception:
     HAS_MEDIA_FOUNDATION = False
     open_recorder = None
+    probe_microphone = None
 
 try:
     import audioop
@@ -403,10 +408,26 @@ def _no_input_device_message() -> str:
     return message + "."
 
 
+def _capture_blockers() -> list[str]:
+    """Windows rules that make capture impossible, if any (policy/privacy/service)."""
+    if os.name != "nt":
+        return []
+    try:
+        from .capture_env import collect
+
+        return list(collect().blockers)
+    except Exception:
+        logger.debug("Не удалось проверить ограничения записи Windows", exc_info=True)
+        return []
+
+
 def _open_microphone_message(error: Optional[BaseException]) -> str:
     detail = str(error) if error else "устройство недоступно"
     message = f"Не удалось открыть микрофон: {detail}"
-    if is_remote_session():
+    blockers = _capture_blockers()
+    if blockers:
+        message += " " + blockers[0]
+    elif is_remote_session():
         message += (
             " Проверьте перенаправление микрофона в RDP: «Локальные ресурсы» → "
             "«Звук» → «Параметры» → «Запись с этого компьютера»."
@@ -749,6 +770,8 @@ class RecordingSession:
             raise AudioError(_no_input_device_message())
         for device in list_input_devices():
             logger.warning("Микрофон %s: %s", device.index, device.label())
+        for blocker in _capture_blockers():
+            logger.warning("Ограничение записи Windows: %s", blocker)
         logger.warning(
             "Не удалось открыть ни один микрофон; последняя ошибка: %s", last_error
         )
@@ -828,10 +851,25 @@ class RecordingSession:
             logger.debug("Не удалось инициализировать COM в потоке записи", exc_info=True)
 
         try:
-            with open_recorder(microphone, seconds=0.1) as recorder:
+            with open_recorder(
+                microphone,
+                seconds=0.1,
+                preferred_rate=int(self.cfg.sample_rate),
+            ) as recorder:
                 self._capture_rate = int(recorder.samplerate)
                 rate = self._capture_rate
                 blocksize = max(256, int(rate * 0.1))
+                for attempt in getattr(recorder, "attempts", []):
+                    logger.info(
+                        "Media Foundation: вариант не подошёл: %s", attempt
+                    )
+                logger.info(
+                    "Media Foundation открыл поток: %s, %d Гц, %d кан., %s",
+                    getattr(recorder, "opened_with", "?"),
+                    recorder.samplerate,
+                    recorder._mix_channels,
+                    recorder.sample_format,
+                )
                 ready.set()
                 while not stop_event.is_set():
                     data = recorder.record(numframes=blocksize)
@@ -1070,6 +1108,31 @@ class RecordingSession:
             result.path = None
 
 
+def _grouped_error_lines(errors: list[tuple[int, int, str]]) -> list[str]:
+    """Every refused format, grouped by the message it produced.
+
+    PortAudio repeats the same host error for each rate/channel attempt, so the
+    previous "last error only" summary hid the fact that some variants failed
+    for a different reason.
+    """
+    if not errors:
+        return ["        форматы не проверялись"]
+    groups: dict[str, list[str]] = {}
+    for rate, channels, message in errors:
+        groups.setdefault(message, []).append(f"{rate} Гц/{channels} кан.")
+    return [
+        f"        {', '.join(variants)}: {message}"
+        for message, variants in groups.items()
+    ]
+
+
+def _capture_env_lines() -> list[str]:
+    """Windows rules that can block capture: RDP policy, privacy, audio services."""
+    from .capture_env import report_lines
+
+    return report_lines()
+
+
 def probe_input_devices(cfg: Optional[Config] = None) -> str:
     """Try to open every input device and describe the result.
 
@@ -1119,6 +1182,10 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.append(f"Не удалось построить список кандидатов: {exc}")
     lines.append("")
 
+    if os.name == "nt":
+        lines.extend(_capture_env_lines())
+        lines.append("")
+
     for device in devices:
         lines.append(f"[{device.index}] {device.label()} | каналов: {device.channels}")
         wasapi = "wasapi" in device.hostapi.casefold()
@@ -1126,7 +1193,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         device_ok = False
         for exclusive in modes:
             mode = "exclusive" if exclusive else "shared"
-            errors: list[str] = []
+            errors: list[tuple[int, int, str]] = []
             opened: Optional[tuple[int, int]] = None
             for rate, channels in session._candidate_formats(device.index):
                 try:
@@ -1134,7 +1201,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                         device.index, rate, channels, exclusive=exclusive
                     )
                 except Exception as exc:
-                    errors.append(f"{rate} Гц / {channels} кан.: {exc}")
+                    errors.append((rate, channels, str(exc).strip()))
                     continue
                 opened = (rate, channels)
                 try:
@@ -1149,10 +1216,10 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 )
                 device_ok = True
                 break
-            last = errors[-1] if errors else "нет данных"
-            lines.append(
-                f"    {mode}: не удалось ({len(errors)} вариантов), последняя ошибка: {last}"
-            )
+            count = len(errors)
+            label = "формат" if count == 1 else "форматов"
+            lines.append(f"    {mode}: не удалось — {count} {label}:")
+            lines.extend(_grouped_error_lines(errors))
             with session._lock:
                 session._chunks.clear()
                 session._frames = 0
@@ -1161,23 +1228,13 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.append("")
 
     if os.name == "nt":
-        lines.append("== Windows Media Foundation ==")
+        lines.append("== Windows Media Foundation (WASAPI) ==")
         microphones = _soundcard_microphones()
-        if not microphones or not HAS_MEDIA_FOUNDATION:
+        if not microphones or not HAS_MEDIA_FOUNDATION or probe_microphone is None:
             lines.append("  Микрофоны не найдены или модуль soundcard недоступен")
         else:
             for microphone in microphones:
-                name = str(getattr(microphone, "name", "?"))
-                try:
-                    with open_recorder(microphone, seconds=0.1) as recorder:
-                        frames = max(256, int(recorder.samplerate * 0.2))
-                        data = recorder.record(numframes=frames)
-                    lines.append(
-                        f"  {name}: OK ({len(data)} отсчётов, "
-                        f"{recorder.samplerate} Гц, {recorder.sample_format})"
-                    )
-                except Exception as exc:
-                    lines.append(f"  {name}: ошибка: {exc}")
+                lines.extend(probe_microphone(microphone, seconds=0.2))
         lines.append("")
 
     lines.append(
