@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 TERMINAL_SERVICES_POLICY_KEY = r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
 WINSTATIONS_KEY = r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
-VOLATILE_ENVIRONMENT_KEY = r"Volatile Environment"
 MICROPHONE_CONSENT_KEY = (
     r"SOFTWARE\Microsoft\Windows\CurrentVersion"
     r"\CapabilityAccessManager\ConsentStore\microphone"
@@ -56,7 +55,6 @@ class CaptureEnvironment:
     is_remote: bool = False
     policies: list[tuple[str, str, str]] = field(default_factory=list)
     station_settings: list[tuple[str, str, str]] = field(default_factory=list)
-    negotiated: list[tuple[str, str, str]] = field(default_factory=list)
     privacy: list[tuple[str, str, str]] = field(default_factory=list)
     services: list[tuple[str, str]] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
@@ -70,7 +68,6 @@ class CaptureEnvironment:
         if self.is_remote:
             label = f"станция {self.station}" if self.station else "настройки станции RDP"
             lines.extend(self._section(label, self.station_settings))
-            lines.extend(self._section("согласовано с клиентом", self.negotiated))
         lines.extend(self._section("доступ к микрофону", self.privacy))
         if self.services:
             lines.append("  службы:")
@@ -123,16 +120,6 @@ def _reg_values(hive, path: str) -> dict[str, str]:
         return {}
 
 
-def _reg_subkeys(hive, path: str) -> list[str]:
-    try:
-        import winreg
-
-        with winreg.OpenKey(hive, path) as key:
-            return [winreg.EnumKey(key, index) for index in range(winreg.QueryInfoKey(key)[0])]
-    except OSError:
-        return []
-
-
 def _hives() -> list[tuple[str, object]]:
     try:
         import winreg
@@ -175,17 +162,6 @@ def _collect_station(station: str) -> list[tuple[str, str, str]]:
         for name in STATION_VALUES
         if name in values
     ]
-
-
-def _collect_negotiated() -> list[tuple[str, str, str]]:
-    """CLIENTAUDIO* values the session host stored from the client's request."""
-    found: list[tuple[str, str, str]] = []
-    for hive_name, hive in _hives():
-        for subkey in _reg_subkeys(hive, VOLATILE_ENVIRONMENT_KEY):
-            for name, value in _reg_values(hive, rf"{VOLATILE_ENVIRONMENT_KEY}\{subkey}").items():
-                if name.upper().startswith("CLIENTAUDIO"):
-                    found.append((f"{hive_name}\\{subkey}", name, value))
-    return found
 
 
 def _collect_privacy() -> list[tuple[str, str, str]]:
@@ -327,7 +303,6 @@ def collect() -> CaptureEnvironment:
     env.station = _station_name(env.session_name) if env.is_remote else ""
     env.policies = _collect_policies()
     env.station_settings = _collect_station(env.station)
-    env.negotiated = _collect_negotiated()
     env.privacy = _collect_privacy()
     env.services = _collect_services()
     env.blockers = _find_blockers(env)

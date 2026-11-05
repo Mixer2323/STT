@@ -10,7 +10,6 @@ def windows(monkeypatch: pytest.MonkeyPatch):
     """Pretend to be Windows with a controllable registry and service manager."""
     state: dict[str, object] = {
         "registry": {},
-        "subkeys": {},
         "services": {},
         "windows": True,
     }
@@ -35,9 +34,6 @@ def windows(monkeypatch: pytest.MonkeyPatch):
             if (h, p) == prefix
         }
 
-    def fake_reg_subkeys(hive, path):
-        return state["subkeys"].get((hive, path), [])
-
     def fake_states(names):
         return [(name, state["services"][name]) for name in names if name in state["services"]]
 
@@ -45,7 +41,6 @@ def windows(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ce, "_hives", fake_hives)
     monkeypatch.setattr(ce, "_reg_value", fake_reg_value)
     monkeypatch.setattr(ce, "_reg_values", fake_reg_values)
-    monkeypatch.setattr(ce, "_reg_subkeys", fake_reg_subkeys)
     monkeypatch.setattr(ce, "_query_service_states", fake_states)
     monkeypatch.setattr(ce, "_is_remote_session", lambda: True)
     monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#32")
@@ -65,12 +60,6 @@ def _station(state, name, value):
 def _consent(state, hive, label, value):
     path = ce.MICROPHONE_CONSENT_KEY + (r"\NonPackaged" if "NonPackaged" in label else "")
     state["registry"][(hive, path, "Value")] = value
-
-
-def _volatile(state, session, name, value):
-    path = rf"{ce.VOLATILE_ENVIRONMENT_KEY}\{session}"
-    state["registry"][("HKCU", path, name)] = value
-    state["subkeys"].setdefault(("HKCU", ce.VOLATILE_ENVIRONMENT_KEY), []).append(session)
 
 
 def _running(state: dict) -> None:
@@ -107,20 +96,6 @@ def test_station_settings_are_read_for_the_current_station(windows) -> None:
     assert "станция RDP-Tcp:" in report
     assert "AudioEnumeratorDll = rdpendp.dll" in report
     assert "ВНИМАНИЕ:" in report
-
-
-def test_negotiated_client_audio_mode_is_reported(windows) -> None:
-    _station(windows, "fDisableAudioCapture", "0")
-    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
-    _volatile(windows, "3", "CLIENTAUDIOCAPTUREMODE", "0")
-    _running(windows)
-
-    env = ce.collect()
-    report = "\n".join(env.report_lines())
-
-    assert env.negotiated == [("HKCU\\3", "CLIENTAUDIOCAPTUREMODE", "0")]
-    assert "согласовано с клиентом:" in report
-    assert "CLIENTAUDIOCAPTUREMODE = 0" in report
 
 
 def test_microphone_privacy_deny_for_desktop_apps(windows) -> None:
@@ -172,7 +147,6 @@ def test_console_session_has_no_station(windows, monkeypatch: pytest.MonkeyPatch
     assert env.station == ""
     assert env.station_settings == []
     assert "станция" not in report
-    assert "согласовано с клиентом" not in report
 
 
 def test_non_windows_collects_nothing(windows) -> None:
@@ -182,7 +156,6 @@ def test_non_windows_collects_nothing(windows) -> None:
 
     assert env.policies == []
     assert env.station_settings == []
-    assert env.negotiated == []
     assert env.privacy == []
     assert env.services == []
 

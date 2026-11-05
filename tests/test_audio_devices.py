@@ -69,6 +69,8 @@ class FakeSoundDevice:
                     self.wasapi_default if self.wasapi_default is not None else -1
                 ),
             },
+            {"name": "Windows DirectSound", "default_input_device": -1},
+            {"name": "Windows WDM-KS", "default_input_device": -1},
         ]
 
     def query_devices(self, device=None, kind=None):
@@ -170,6 +172,99 @@ def test_candidate_formats_prefer_native_rate(fake_sd: FakeSoundDevice) -> None:
     assert formats[0] == (48000, 1)
     assert formats[1] == (48000, 2)
     assert (16000, 1) in formats
+
+
+def _field_machine() -> list[dict]:
+    """Devices of the reported RDP machine: the session host APIs only carry the
+    redirected endpoint, the physical microphones show up through WDM-KS."""
+    return [
+        _device(1, "Удаленное аудио", channels=2, hostapi=0),
+        _device(5, "Удаленное аудио", channels=2, hostapi=2),
+        _device(9, "Удаленное аудио", channels=2, hostapi=1),
+        _device(10, "FrontMic (Realtek HD Audio)", channels=2, hostapi=3),
+        _device(11, "Лин. вход (Realtek HD Audio Line input)", channels=2, hostapi=3),
+        _device(12, "Стерео микшер", channels=2, hostapi=3),
+        _device(14, "Микрофон (Logi USB Headset H340)", channels=2, hostapi=3),
+    ]
+
+
+def test_wdm_microphones_come_after_the_wasapi_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    candidates = audio.RecordingSession(Config())._candidate_devices(1)
+
+    assert candidates[0] == 9
+    assert candidates.index(10) < candidates.index(14) < candidates.index(11)
+    assert candidates.index(11) < candidates.index(5)
+    assert 12 not in candidates
+
+
+def test_start_records_from_the_server_mic_when_rdp_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    fake.failing_devices = {1, 5, 9}
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+
+    assert session.is_recording
+    assert fake.opened[-1][0] in (10, 14)
+    session.stop()
+
+
+def test_server_side_device_is_not_reported_as_fallback_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+
+    assert audio._is_server_side_fallback(14)
+    assert not audio._is_server_side_fallback(9)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: False)
+    assert not audio._is_server_side_fallback(14)
+
+
+def test_verdict_blames_the_client_when_the_endpoint_exists_but_refuses() -> None:
+    lines = audio._verdict_lines(
+        is_rdp=True,
+        opened=["[14] Микрофон (Logi USB Headset H340)"],
+        failed_redirect=["[9] Удаленное аудио"],
+        local_opened=["[14] Микрофон (Logi USB Headset H340)"],
+        redirect_seen=True,
+        mf_text="Initialize [формат устройства]: HRESULT 0x80070057 (E_INVALIDARG)",
+        blockers=[],
+    )
+
+    report = "\n".join(lines)
+    assert "IAudioClient::Initialize возвращает E_INVALIDARG" in report
+    assert "Проверять нужно клиент, а не сервер" in report
+    assert "записывать с микрофона сервера" in report
+
+
+def test_verdict_names_absent_redirect_as_client_request() -> None:
+    lines = audio._verdict_lines(
+        is_rdp=True,
+        opened=["[10] FrontMic (Realtek HD Audio)"],
+        failed_redirect=[],
+        local_opened=["[10] FrontMic (Realtek HD Audio)"],
+        redirect_seen=False,
+        mf_text="",
+        blockers=[],
+    )
+
+    report = "\n".join(lines)
+    assert "Перенаправленного микрофона RDP в сеансе нет" in report
+    assert "audiocapturemode:i:1" in report
 
 
 def test_start_falls_back_when_mme_rejects_rate(fake_sd: FakeSoundDevice) -> None:

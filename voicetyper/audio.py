@@ -271,6 +271,73 @@ def _is_wasapi_index(device_index: Optional[int]) -> bool:
     return "wasapi" in _hostapi_name(device_index).casefold()
 
 
+def _device_name(device_index: Optional[int]) -> str:
+    if not HAS_SOUNDDEVICE or device_index is None:
+        return ""
+    try:
+        return str(sd.query_devices(device_index, "input").get("name", ""))
+    except Exception:
+        return ""
+
+
+_MIXER_ENDPOINT_HINTS = ("микшер", "stereo mix", "what u hear", "mixer", "loopback")
+_MICROPHONE_HINTS = (
+    "микрофон",
+    "microphone",
+    "mic",
+    "гарнитур",
+    "headset",
+    "головн",
+)
+# WDM-KS talks to the hardware directly, so it still sees the microphones
+# attached to the server when an RDP session's WASAPI only exposes the
+# redirected endpoint. MME and DirectSound mirror the session endpoints.
+_LAST_RESORT_HOST_APIS = ("wdm-ks", "directsound", "mme")
+
+
+def _is_mixer_endpoint(name: str) -> bool:
+    lowered = name.casefold()
+    return any(hint in lowered for hint in _MIXER_ENDPOINT_HINTS)
+
+
+def _looks_like_microphone(name: str) -> bool:
+    lowered = name.casefold()
+    return any(hint in lowered for hint in _MICROPHONE_HINTS)
+
+
+def _other_hostapi_devices() -> list[int]:
+    """Non-WASAPI input indices, most likely to record voice first."""
+
+    def rank(device: InputDevice) -> tuple[int, int]:
+        api = device.hostapi.casefold()
+        position = next(
+            (index for index, name in enumerate(_LAST_RESORT_HOST_APIS) if name in api),
+            len(_LAST_RESORT_HOST_APIS),
+        )
+        return position, 0 if _looks_like_microphone(device.name) else 1
+
+    return [
+        device.index
+        for device in sorted(
+            (
+                device
+                for device in list_input_devices()
+                if "wasapi" not in device.hostapi.casefold()
+                and not _is_mixer_endpoint(device.name)
+            ),
+            key=rank,
+        )
+    ]
+
+
+def _is_server_side_fallback(device_index: Optional[int]) -> bool:
+    """True when an RDP session ended up recording from the server's own mic."""
+    if not is_remote_session():
+        return False
+    name = _device_name(device_index)
+    return bool(name) and not _is_redirected_endpoint(name)
+
+
 def _wasapi_exclusive_settings() -> object:
     """``WasapiSettings(exclusive=True)`` or ``None`` when unavailable."""
     if not HAS_SOUNDDEVICE:
@@ -671,9 +738,11 @@ class RecordingSession:
         On Windows the WASAPI endpoint is preferred: it is what other
         applications use, and MME/DirectSound cannot open the RDP "Remote
         Audio" device. An explicitly selected device is tried first, with its
-        WASAPI equivalent as a fallback. All WASAPI input devices are tried as
-        a last resort, because the default endpoint reported by PortAudio is
-        not always the one that actually carries audio.
+        WASAPI equivalent as a fallback. All WASAPI input devices are tried
+        before that, because the default endpoint reported by PortAudio is not
+        always the one that actually carries audio. Last come the devices of the
+        other host APIs — in an RDP session those are the microphones physically
+        attached to the server, which is better than not recording at all.
         """
         wasapi_devices = [
             device.index
@@ -700,6 +769,8 @@ class RecordingSession:
                 add(index)
             add(device_index)
             add(_system_default_input())
+        for index in _other_hostapi_devices():
+            add(index)
         if not ordered:
             ordered.append(None)
         return ordered
@@ -758,6 +829,12 @@ class RecordingSession:
                             channels,
                             "exclusive" if exclusive else "shared",
                         )
+                        if _is_server_side_fallback(candidate):
+                            logger.warning(
+                                "Перенаправленный микрофон RDP не открылся — запись идёт "
+                                "с устройства, подключённого к серверу: %s",
+                                _device_name(candidate),
+                            )
                         return stream, rate, channels, candidate
                 logger.warning(
                     "Микрофон %s (%s) не открылся: %s",
@@ -1146,6 +1223,8 @@ def _verdict_lines(
     is_rdp: bool,
     opened: list[str],
     failed_redirect: list[str],
+    local_opened: list[str],
+    redirect_seen: bool,
     mf_text: str,
     blockers: list[str],
 ) -> list[str]:
@@ -1156,6 +1235,19 @@ def _verdict_lines(
             "  Причина в ограничениях Windows — см. строки ВНИМАНИЕ в разделе "
             "«Ограничения записи Windows»."
         )
+        return lines
+    if is_rdp and not redirect_seen:
+        lines.append(
+            "  Перенаправленного микрофона RDP в сеансе нет — сервер не создал "
+            "конечную точку записи, потому что клиент не запросил переадресацию: "
+            "в клиенте RDP «Локальные ресурсы» → «Звук» → «Параметры» → «Запись с "
+            "этого компьютера» = «Этот компьютер» (в .rdp-файле audiocapturemode:i:1)."
+        )
+        if opened:
+            lines.append(
+                "  С микрофона, подключённого к серверу, запись доступна: "
+                + "; ".join((local_opened or opened)[:3])
+            )
         return lines
     if failed_redirect and not opened:
         lines.append(
@@ -1174,17 +1266,27 @@ def _verdict_lines(
         )
         if "Initialize" in mf_text and "E_INVALIDARG" in mf_text:
             lines.append(
-                "  Endpoint отвечает на GetMixFormat, но IAudioClient::Initialize "
-                "возвращает E_INVALIDARG даже для формата устройства — так ведёт себя "
-                "запись, которую сервер создал, но клиент не разрешил перенаправлять."
+                "  Конечная точка существует и отвечает на GetMixFormat, но "
+                "IAudioClient::Initialize возвращает E_INVALIDARG даже для её "
+                "собственного формата: сервер точку создал, а звук от клиента не "
+                "приходит."
             )
         lines.append(
-            "  Что проверить: в клиенте RDP «Локальные ресурсы» → «Звук» → «Параметры» "
-            "→ «Запись с этого компьютера» = «Этот компьютер» (в .rdp-файле "
-            "audiocapturemode:i:1) и что микрофон разрешён на самом клиенте; на сервере "
-            "— политику «Разрешить переадресацию аудиозаписи». Если микрофон физически "
-            "подключён к серверу, выберите его в настройках приложения напрямую."
+            "  Проверять нужно клиент, а не сервер — на нём ограничения записи не "
+            "найдены. На машине, с которой выполняется подключение: разрешите доступ "
+            "к микрофону для «Подключение к удалённому рабочему столу» (Параметры → "
+            "Конфиденциальность → Микрофон), включите «Запись с этого компьютера» = "
+            "«Этот компьютер» (audiocapturemode:i:1) и убедитесь, что микрофон на "
+            "клиенте работает. Клиенты для macOS, iOS, Android и браузер переадресацию "
+            "записи не поддерживают."
         )
+        if local_opened:
+            lines.append(
+                "  До настройки перенаправления приложение будет записывать с "
+                "микрофона сервера: "
+                + "; ".join(local_opened[:3])
+                + " — говорить нужно в него."
+            )
         return lines
     if opened:
         lines.append(
@@ -1251,8 +1353,12 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.append("")
 
     opened_labels: list[str] = []
+    local_opened: list[str] = []
     failed_redirect: list[str] = []
+    redirect_seen = False
     for device in devices:
+        redirected = _is_redirected_endpoint(device.name)
+        redirect_seen = redirect_seen or redirected
         lines.append(f"[{device.index}] {device.label()} | каналов: {device.channels}")
         wasapi = "wasapi" in device.hostapi.casefold()
         modes = (False, True) if wasapi else (False,)
@@ -1282,6 +1388,8 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 )
                 device_ok = True
                 opened_labels.append(f"[{device.index}] {device.name}")
+                if not redirected:
+                    local_opened.append(f"[{device.index}] {device.name}")
                 break
             count = len(errors)
             label = "формат" if count == 1 else "форматов"
@@ -1292,7 +1400,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 session._frames = 0
         if not device_ok:
             lines.append("    ИТОГ: устройство не открывается")
-            if _is_redirected_endpoint(device.name):
+            if redirected:
                 failed_redirect.append(f"[{device.index}] {device.name}")
         lines.append("")
 
@@ -1314,6 +1422,8 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
             is_rdp=remote,
             opened=opened_labels,
             failed_redirect=failed_redirect,
+            local_opened=local_opened,
+            redirect_seen=redirect_seen,
             mf_text="\n".join(mf_lines),
             blockers=blockers,
         )
