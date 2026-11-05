@@ -3,7 +3,7 @@
 APP_ID = "VoiceTyper"
 APP_NAME = "VoiceTyper"
 APP_TITLE = "Voice Typer"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 CONFIG_VERSION = 3
 HISTORY_VERSION = 1
 
