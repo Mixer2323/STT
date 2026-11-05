@@ -17,11 +17,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 TERMINAL_SERVICES_POLICY_KEY = r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+WINSTATIONS_KEY = r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+VOLATILE_ENVIRONMENT_KEY = r"Volatile Environment"
 MICROPHONE_CONSENT_KEY = (
     r"SOFTWARE\Microsoft\Windows\CurrentVersion"
     r"\CapabilityAccessManager\ConsentStore\microphone"
 )
-CAPTURE_POLICY_VALUES = ("DisableAudioCapture", "DisableAudioPlayback")
+# The ADMX policy "Allow audio recording redirection" writes fDisableAudioCapture
+# (0 = allowed); the unprefixed names are kept because older templates use them.
+CAPTURE_POLICY_VALUES = (
+    "fDisableAudioCapture",
+    "fDisableAudioPlayback",
+    "DisableAudioCapture",
+    "DisableAudioPlayback",
+)
+STATION_VALUES = ("fDisableAudioCapture", "fDisableAudioPlayback", "AudioEnumeratorDll")
 AUDIO_SERVICES = ("Audiosrv", "AudioEndpointBuilder")
 
 _SERVICE_STATES = {
@@ -42,8 +52,11 @@ class CaptureEnvironment:
 
     session_name: str = ""
     client_name: str = ""
+    station: str = ""
     is_remote: bool = False
     policies: list[tuple[str, str, str]] = field(default_factory=list)
+    station_settings: list[tuple[str, str, str]] = field(default_factory=list)
+    negotiated: list[tuple[str, str, str]] = field(default_factory=list)
     privacy: list[tuple[str, str, str]] = field(default_factory=list)
     services: list[tuple[str, str]] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
@@ -54,6 +67,10 @@ class CaptureEnvironment:
         suffix = f", клиент: {self.client_name}" if self.client_name else ""
         lines.append(f"  сеанс: {self.session_name or '?'} ({kind}{suffix})")
         lines.extend(self._section("политика RDP", self.policies))
+        if self.is_remote:
+            label = f"станция {self.station}" if self.station else "настройки станции RDP"
+            lines.extend(self._section(label, self.station_settings))
+            lines.extend(self._section("согласовано с клиентом", self.negotiated))
         lines.extend(self._section("доступ к микрофону", self.privacy))
         if self.services:
             lines.append("  службы:")
@@ -73,8 +90,8 @@ class CaptureEnvironment:
         if not entries:
             return [f"  {label}: значения не заданы"]
         lines = [f"  {label}:"]
-        for hive, name, value in entries:
-            lines.append(f"    {hive}\\{name} = {value}")
+        for source, name, value in entries:
+            lines.append(f"    {source}\\{name} = {value}")
         return lines
 
 
@@ -92,12 +109,43 @@ def _reg_value(hive, path: str, name: str) -> Optional[str]:
         return None
 
 
+def _reg_values(hive, path: str) -> dict[str, str]:
+    try:
+        import winreg
+
+        with winreg.OpenKey(hive, path) as key:
+            out: dict[str, str] = {}
+            for index in range(winreg.QueryInfoKey(key)[1]):
+                name, value, _kind = winreg.EnumValue(key, index)
+                out[str(name)] = str(value)
+            return out
+    except OSError:
+        return {}
+
+
+def _reg_subkeys(hive, path: str) -> list[str]:
+    try:
+        import winreg
+
+        with winreg.OpenKey(hive, path) as key:
+            return [winreg.EnumKey(key, index) for index in range(winreg.QueryInfoKey(key)[0])]
+    except OSError:
+        return []
+
+
 def _hives() -> list[tuple[str, object]]:
     try:
         import winreg
     except ImportError:
         return []
     return [("HKLM", winreg.HKEY_LOCAL_MACHINE), ("HKCU", winreg.HKEY_CURRENT_USER)]
+
+
+def _local_machine():
+    for name, hive in _hives():
+        if name == "HKLM":
+            return hive
+    return None
 
 
 def _collect_policies() -> list[tuple[str, str, str]]:
@@ -107,6 +155,36 @@ def _collect_policies() -> list[tuple[str, str, str]]:
             value = _reg_value(hive, TERMINAL_SERVICES_POLICY_KEY, name)
             if value is not None:
                 found.append((hive_name, name, value))
+    return found
+
+
+def _station_name(session_name: str) -> str:
+    """WinStations subkey for the current session: RDP-Tcp#32 -> RDP-Tcp."""
+    if not session_name or session_name.strip().lower() == "console":
+        return ""
+    return session_name.split("#", 1)[0].strip()
+
+
+def _collect_station(station: str) -> list[tuple[str, str, str]]:
+    hive = _local_machine()
+    if hive is None or not station:
+        return []
+    values = _reg_values(hive, rf"{WINSTATIONS_KEY}\{station}")
+    return [
+        (f"HKLM\\{station}", name, values[name])
+        for name in STATION_VALUES
+        if name in values
+    ]
+
+
+def _collect_negotiated() -> list[tuple[str, str, str]]:
+    """CLIENTAUDIO* values the session host stored from the client's request."""
+    found: list[tuple[str, str, str]] = []
+    for hive_name, hive in _hives():
+        for subkey in _reg_subkeys(hive, VOLATILE_ENVIRONMENT_KEY):
+            for name, value in _reg_values(hive, rf"{VOLATILE_ENVIRONMENT_KEY}\{subkey}").items():
+                if name.upper().startswith("CLIENTAUDIO"):
+                    found.append((f"{hive_name}\\{subkey}", name, value))
     return found
 
 
@@ -195,14 +273,24 @@ def _is_remote_session() -> bool:
 
 def _find_blockers(env: CaptureEnvironment) -> list[str]:
     blockers: list[str] = []
-    for hive, name, value in env.policies:
-        if name == "DisableAudioCapture" and value.strip() == "1":
+    for source, name, value in list(env.policies) + list(env.station_settings):
+        if name.lower().endswith("audiocapture") and value.strip() == "1":
             blockers.append(
-                f"политика {hive} запрещает перенаправление записи в RDP "
-                "(DisableAudioCapture=1). Микрофон клиента в сеанс не поступает: "
-                "разрешите «Разрешить переадресацию аудиозаписи» в групповой политике "
-                "или на сервере."
+                f"{source}\\{name} = 1 запрещает перенаправление записи в RDP. "
+                "Микрофон клиента в сеанс не поступает: на сервере включите "
+                "«Разрешить переадресацию аудиозаписи» (Components → Remote Desktop "
+                "Session Host → Device and Resource Redirection)."
             )
+    if env.is_remote and env.station_settings and not any(
+        name == "AudioEnumeratorDll" for _source, name, _value in env.station_settings
+    ):
+        blockers.append(
+            f"на станции {env.station} не задан AudioEnumeratorDll — сервер не "
+            "создаёт перенаправленные аудиоконечные точки. В компонентах Windows "
+            "нужен «Пользовательские интерфейсы и инфраструктура» "
+            "(User Interfaces and Infrastructure), служба Windows Audio должна "
+            "работать в сеансе."
+        )
     for hive, label, value in env.privacy:
         if value.strip().casefold() != "deny":
             continue
@@ -236,7 +324,10 @@ def collect() -> CaptureEnvironment:
     )
     if not _is_windows():
         return env
+    env.station = _station_name(env.session_name) if env.is_remote else ""
     env.policies = _collect_policies()
+    env.station_settings = _collect_station(env.station)
+    env.negotiated = _collect_negotiated()
     env.privacy = _collect_privacy()
     env.services = _collect_services()
     env.blockers = _find_blockers(env)
@@ -258,6 +349,13 @@ def summary_lines(env: Optional[CaptureEnvironment] = None) -> list[str]:
         "Политика RDP: "
         + (", ".join(f"{hive} {name}={value}" for hive, name, value in env.policies)
            or "не задана"),
+        "Станция RDP: "
+        + (
+            ", ".join(
+                f"{name}={value}" for _source, name, value in env.station_settings
+            )
+            or "не задана"
+        ),
         "Доступ к микрофону: "
         + (", ".join(f"{hive} {label}={value}" for hive, label, value in env.privacy)
            or "не задан"),

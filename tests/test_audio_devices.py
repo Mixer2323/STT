@@ -339,13 +339,23 @@ def test_all_wasapi_devices_are_tried(monkeypatch: pytest.MonkeyPatch) -> None:
     session.stop()
 
 
+class _StubEnv:
+    """Stand-in for capture_env.CaptureEnvironment in report tests."""
+
+    def __init__(self, blockers=()) -> None:
+        self.blockers = list(blockers)
+
+    def report_lines(self) -> list[str]:
+        return ["== Ограничения записи Windows =="]
+
+
 def test_probe_input_devices_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
     devices = [_device(2, "Удалённое аудио", hostapi=1, channels=1, rate=48000.0)]
     fake = FakeSoundDevice(devices, default_index=2, wasapi_default=2)
     monkeypatch.setattr(audio, "sd", fake)
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
     monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
-    monkeypatch.setattr(audio, "_capture_env_lines", lambda: ["== Ограничения записи Windows =="])
+    monkeypatch.setattr(audio, "_capture_env", lambda: _StubEnv())
 
     report = audio.probe_input_devices(Config())
 
@@ -353,6 +363,7 @@ def test_probe_input_devices_reports_success(monkeypatch: pytest.MonkeyPatch) ->
     assert "[2] Удалённое аудио" in report
     assert "shared: OK" in report
     assert "== Ограничения записи Windows ==" in report
+    assert "== Вывод ==" in report
 
 
 def test_probe_input_devices_lists_every_refused_format(
@@ -363,7 +374,7 @@ def test_probe_input_devices_lists_every_refused_format(
     monkeypatch.setattr(audio, "sd", fake)
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
     monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
-    monkeypatch.setattr(audio, "_capture_env_lines", lambda: [])
+    monkeypatch.setattr(audio, "_capture_env", lambda: _StubEnv())
 
     def refusing_open(self, device, rate, channels, *, exclusive=False):
         if rate in (44100, 48000):
@@ -379,6 +390,53 @@ def test_probe_input_devices_lists_every_refused_format(
     assert "Unanticipated host error [MME error 11]" in report
     assert "Invalid sample rate" in report
     assert "ИТОГ: устройство не открывается" in report
+
+
+def test_probe_explains_a_blocked_rdp_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [
+        _device(9, "Удаленное аудио", hostapi=1, rate=44100.0),
+        _device(1, "Микрофон (Logi USB Headset)", hostapi=0, rate=44100.0),
+    ]
+    fake = FakeSoundDevice(devices, default_index=1, wasapi_default=9, failing_devices={9})
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+    monkeypatch.setattr(audio, "_capture_env", lambda: _StubEnv())
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [FakeMicrophone()])
+    monkeypatch.setattr(
+        audio,
+        "probe_microphone",
+        lambda microphone, seconds=0.2: [
+            "  Удаленное аудио:",
+            "    формат устройства: 44100 Гц, 2 кан.",
+            "    захват: ошибка: Initialize [формат устройства, буфер 0]: "
+            "HRESULT 0x80070057 (E_INVALIDARG)",
+        ],
+    )
+
+    report = audio.probe_input_devices(Config())
+
+    assert "Перенаправленный микрофон RDP не открывается" in report
+    assert "IAudioClient::Initialize возвращает E_INVALIDARG" in report
+    assert "audiocapturemode:i:1" in report
+    assert "== Вывод ==" in report
+
+
+def test_probe_points_at_windows_blockers(monkeypatch: pytest.MonkeyPatch) -> None:
+    devices = [_device(9, "Удаленное аудио", hostapi=1, rate=44100.0)]
+    fake = FakeSoundDevice(devices, default_index=9, wasapi_default=9, failing_devices={9})
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [])
+    monkeypatch.setattr(
+        audio, "_capture_env", lambda: _StubEnv(["микрофон запрещён политикой."])
+    )
+
+    report = audio.probe_input_devices(Config())
+
+    assert "Причина в ограничениях Windows" in report
+    assert "Если ни одно устройство не открылось" not in report
 
 
 class FakeRecorder:

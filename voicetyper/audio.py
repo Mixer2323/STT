@@ -1126,11 +1126,73 @@ def _grouped_error_lines(errors: list[tuple[int, int, str]]) -> list[str]:
     ]
 
 
-def _capture_env_lines() -> list[str]:
-    """Windows rules that can block capture: RDP policy, privacy, audio services."""
-    from .capture_env import report_lines
+def _capture_env():
+    """The Windows capture environment snapshot (policy, privacy, services)."""
+    from .capture_env import collect
 
-    return report_lines()
+    return collect()
+
+
+_REDIRECTED_KEYWORDS = ("удаленн", "remote audio", "перенаправл", "rdp")
+
+
+def _is_redirected_endpoint(name: str) -> bool:
+    lowered = name.casefold()
+    return any(keyword in lowered for keyword in _REDIRECTED_KEYWORDS)
+
+
+def _verdict_lines(
+    *,
+    is_rdp: bool,
+    opened: list[str],
+    failed_redirect: list[str],
+    mf_text: str,
+    blockers: list[str],
+) -> list[str]:
+    """Say in plain words what the device table means, so the user knows what to fix."""
+    lines = ["== Вывод =="]
+    if blockers:
+        lines.append(
+            "  Причина в ограничениях Windows — см. строки ВНИМАНИЕ в разделе "
+            "«Ограничения записи Windows»."
+        )
+        return lines
+    if failed_redirect and not opened:
+        lines.append(
+            "  Не открывается ни одно устройство записи. Проверьте, что в сеансе "
+            "работает служба Windows Audio и что микрофон разрешён в параметрах "
+            "конфиденциальности Windows."
+        )
+        return lines
+    if is_rdp and failed_redirect:
+        lines.append(
+            "  Перенаправленный микрофон RDP не открывается ("
+            + "; ".join(failed_redirect)
+            + "), при этом другие устройства работают ("
+            + "; ".join(opened)
+            + ")."
+        )
+        if "Initialize" in mf_text and "E_INVALIDARG" in mf_text:
+            lines.append(
+                "  Endpoint отвечает на GetMixFormat, но IAudioClient::Initialize "
+                "возвращает E_INVALIDARG даже для формата устройства — так ведёт себя "
+                "запись, которую сервер создал, но клиент не разрешил перенаправлять."
+            )
+        lines.append(
+            "  Что проверить: в клиенте RDP «Локальные ресурсы» → «Звук» → «Параметры» "
+            "→ «Запись с этого компьютера» = «Этот компьютер» (в .rdp-файле "
+            "audiocapturemode:i:1) и что микрофон разрешён на самом клиенте; на сервере "
+            "— политику «Разрешить переадресацию аудиозаписи». Если микрофон физически "
+            "подключён к серверу, выберите его в настройках приложения напрямую."
+        )
+        return lines
+    if opened:
+        lines.append(
+            "  Запись работает хотя бы на одном устройстве: " + "; ".join(opened[:3])
+        )
+    else:
+        lines.append("  Очевидной причины не видно — пришлите этот отчёт разработчику.")
+    return lines
 
 
 def probe_input_devices(cfg: Optional[Config] = None) -> str:
@@ -1182,10 +1244,14 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.append(f"Не удалось построить список кандидатов: {exc}")
     lines.append("")
 
-    if os.name == "nt":
-        lines.extend(_capture_env_lines())
+    env = _capture_env() if os.name == "nt" else None
+    blockers = list(env.blockers) if env is not None else []
+    if env is not None:
+        lines.extend(env.report_lines())
         lines.append("")
 
+    opened_labels: list[str] = []
+    failed_redirect: list[str] = []
     for device in devices:
         lines.append(f"[{device.index}] {device.label()} | каналов: {device.channels}")
         wasapi = "wasapi" in device.hostapi.casefold()
@@ -1215,6 +1281,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                     f"    {mode}: OK — {opened[0]} Гц, {opened[1]} каналов"
                 )
                 device_ok = True
+                opened_labels.append(f"[{device.index}] {device.name}")
                 break
             count = len(errors)
             label = "формат" if count == 1 else "форматов"
@@ -1225,22 +1292,38 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 session._frames = 0
         if not device_ok:
             lines.append("    ИТОГ: устройство не открывается")
+            if _is_redirected_endpoint(device.name):
+                failed_redirect.append(f"[{device.index}] {device.name}")
         lines.append("")
 
+    mf_lines: list[str] = []
     if os.name == "nt":
-        lines.append("== Windows Media Foundation (WASAPI) ==")
+        mf_lines.append("== Windows Media Foundation (WASAPI) ==")
         microphones = _soundcard_microphones()
         if not microphones or not HAS_MEDIA_FOUNDATION or probe_microphone is None:
-            lines.append("  Микрофоны не найдены или модуль soundcard недоступен")
+            mf_lines.append("  Микрофоны не найдены или модуль soundcard недоступен")
         else:
             for microphone in microphones:
-                lines.extend(probe_microphone(microphone, seconds=0.2))
-        lines.append("")
+                mf_lines.extend(probe_microphone(microphone, seconds=0.2))
+        mf_lines.append("")
+        lines.extend(mf_lines)
 
-    lines.append(
-        "Если ни одно устройство не открылось, проверьте перенаправление микрофона "
-        "в клиенте RDP («Локальные ресурсы» → «Звук» → «Параметры» → «Запись с "
-        "этого компьютера») и разрешение доступа к микрофону в параметрах Windows."
+    remote = is_remote_session()
+    lines.extend(
+        _verdict_lines(
+            is_rdp=remote,
+            opened=opened_labels,
+            failed_redirect=failed_redirect,
+            mf_text="\n".join(mf_lines),
+            blockers=blockers,
+        )
     )
+    lines.append("")
+    if not opened_labels and not blockers and not (remote and failed_redirect):
+        lines.append(
+            "Если ни одно устройство не открылось, проверьте перенаправление микрофона "
+            "в клиенте RDP («Локальные ресурсы» → «Звук» → «Параметры» → «Запись с "
+            "этого компьютера») и разрешение доступа к микрофону в параметрах Windows."
+        )
     return "\n".join(lines) + "\n"
 

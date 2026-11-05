@@ -8,7 +8,12 @@ from voicetyper import capture_env as ce
 @pytest.fixture()
 def windows(monkeypatch: pytest.MonkeyPatch):
     """Pretend to be Windows with a controllable registry and service manager."""
-    state: dict[str, object] = {"registry": {}, "services": {}, "windows": True}
+    state: dict[str, object] = {
+        "registry": {},
+        "subkeys": {},
+        "services": {},
+        "windows": True,
+    }
 
     def fake_hives():
         if not state["windows"]:
@@ -20,16 +25,31 @@ def windows(monkeypatch: pytest.MonkeyPatch):
             raise AssertionError("registry must not be read outside Windows")
         return state["registry"].get((hive, path, name))
 
+    def fake_reg_values(hive, path):
+        if not state["windows"]:
+            raise AssertionError("registry must not be read outside Windows")
+        prefix = (hive, path)
+        return {
+            name: value
+            for (h, p, name), value in state["registry"].items()
+            if (h, p) == prefix
+        }
+
+    def fake_reg_subkeys(hive, path):
+        return state["subkeys"].get((hive, path), [])
+
     def fake_states(names):
         return [(name, state["services"][name]) for name in names if name in state["services"]]
 
     monkeypatch.setattr(ce, "_is_windows", lambda: bool(state["windows"]))
     monkeypatch.setattr(ce, "_hives", fake_hives)
     monkeypatch.setattr(ce, "_reg_value", fake_reg_value)
+    monkeypatch.setattr(ce, "_reg_values", fake_reg_values)
+    monkeypatch.setattr(ce, "_reg_subkeys", fake_reg_subkeys)
     monkeypatch.setattr(ce, "_query_service_states", fake_states)
     monkeypatch.setattr(ce, "_is_remote_session", lambda: True)
-    monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#0")
-    monkeypatch.setenv("CLIENTNAME", "OFFICE-PC")
+    monkeypatch.setenv("SESSIONNAME", "RDP-Tcp#32")
+    monkeypatch.setenv("CLIENTNAME", "PC")
     return state
 
 
@@ -37,45 +57,76 @@ def _policy(state, hive, name, value):
     state["registry"][(hive, ce.TERMINAL_SERVICES_POLICY_KEY, name)] = value
 
 
+def _station(state, name, value):
+    path = rf"{ce.WINSTATIONS_KEY}\RDP-Tcp"
+    state["registry"][("HKLM", path, name)] = value
+
+
 def _consent(state, hive, label, value):
     path = ce.MICROPHONE_CONSENT_KEY + (r"\NonPackaged" if "NonPackaged" in label else "")
     state["registry"][(hive, path, "Value")] = value
 
 
-def test_collect_reads_policy_privacy_and_services(windows) -> None:
-    _policy(windows, "HKLM", "DisableAudioCapture", "0")
-    _consent(windows, "HKLM", "microphone", "Allow")
-    _consent(windows, "HKLM", "microphone\\NonPackaged", "Allow")
-    windows["services"] = {"Audiosrv": "запущена", "AudioEndpointBuilder": "запущена"}
+def _volatile(state, session, name, value):
+    path = rf"{ce.VOLATILE_ENVIRONMENT_KEY}\{session}"
+    state["registry"][("HKCU", path, name)] = value
+    state["subkeys"].setdefault(("HKCU", ce.VOLATILE_ENVIRONMENT_KEY), []).append(session)
+
+
+def _running(state: dict) -> None:
+    state["services"] = {"Audiosrv": "запущена", "AudioEndpointBuilder": "запущена"}
+
+
+def test_the_policy_value_name_is_the_documented_one(windows) -> None:
+    _policy(windows, "HKLM", "fDisableAudioCapture", "1")
+    _station(windows, "fDisableAudioCapture", "0")
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
+    _running(windows)
 
     env = ce.collect()
 
-    assert env.is_remote
-    assert env.session_name == "RDP-Tcp#0"
-    assert env.client_name == "OFFICE-PC"
-    assert env.policies == [("HKLM", "DisableAudioCapture", "0")]
-    assert env.privacy == [
-        ("HKLM", "microphone", "Allow"),
-        ("HKLM", "microphone\\NonPackaged", "Allow"),
+    assert env.policies == [("HKLM", "fDisableAudioCapture", "1")]
+    assert env.station == "RDP-Tcp"
+    assert len(env.blockers) == 1
+    assert "HKLM\\fDisableAudioCapture = 1" in env.blockers[0]
+    assert "Разрешить переадресацию аудиозаписи" in env.blockers[0]
+
+
+def test_station_settings_are_read_for_the_current_station(windows) -> None:
+    _station(windows, "fDisableAudioCapture", "1")
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
+    _running(windows)
+
+    env = ce.collect()
+    report = "\n".join(env.report_lines())
+
+    assert env.station_settings == [
+        ("HKLM\\RDP-Tcp", "fDisableAudioCapture", "1"),
+        ("HKLM\\RDP-Tcp", "AudioEnumeratorDll", "rdpendp.dll"),
     ]
-    assert env.services == [("Audiosrv", "запущена"), ("AudioEndpointBuilder", "запущена")]
-    assert env.blockers == []
-
-
-def test_capture_redirection_policy_is_reported_as_a_blocker(windows) -> None:
-    _policy(windows, "HKLM", "DisableAudioCapture", "1")
-    windows["services"] = {"Audiosrv": "запущена", "AudioEndpointBuilder": "запущена"}
-
-    report = "\n".join(ce.report_lines())
-
-    assert "HKLM\\DisableAudioCapture = 1" in report
+    assert "станция RDP-Tcp:" in report
+    assert "AudioEnumeratorDll = rdpendp.dll" in report
     assert "ВНИМАНИЕ:" in report
-    assert "DisableAudioCapture=1" in report
+
+
+def test_negotiated_client_audio_mode_is_reported(windows) -> None:
+    _station(windows, "fDisableAudioCapture", "0")
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
+    _volatile(windows, "3", "CLIENTAUDIOCAPTUREMODE", "0")
+    _running(windows)
+
+    env = ce.collect()
+    report = "\n".join(env.report_lines())
+
+    assert env.negotiated == [("HKCU\\3", "CLIENTAUDIOCAPTUREMODE", "0")]
+    assert "согласовано с клиентом:" in report
+    assert "CLIENTAUDIOCAPTUREMODE = 0" in report
 
 
 def test_microphone_privacy_deny_for_desktop_apps(windows) -> None:
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
     _consent(windows, "HKCU", "microphone\\NonPackaged", "Deny")
-    windows["services"] = {"Audiosrv": "запущена", "AudioEndpointBuilder": "запущена"}
+    _running(windows)
 
     env = ce.collect()
 
@@ -92,19 +143,36 @@ def test_stopped_audio_service_is_a_blocker(windows) -> None:
     assert "Windows Audio" in report
 
 
+def test_healthy_environment_says_so(windows) -> None:
+    _station(windows, "fDisableAudioCapture", "0")
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
+    _consent(windows, "HKLM", "microphone", "Allow")
+    _running(windows)
+
+    report = "\n".join(ce.report_lines())
+
+    assert "ограничений, которые мешают записи, не найдено" in report
+    assert "ВНИМАНИЕ" not in report
+
+
 def test_service_state_codes_match_the_windows_api() -> None:
     assert ce._RUNNING == 4
     assert ce._SERVICE_STATES[ce._RUNNING] == "запущена"
     assert ce._SERVICE_STATES[1] == "остановлена"
 
 
-def test_healthy_environment_says_so(windows) -> None:
-    windows["services"] = {"Audiosrv": "запущена", "AudioEndpointBuilder": "запущена"}
+def test_console_session_has_no_station(windows, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ce, "_is_remote_session", lambda: False)
+    monkeypatch.setenv("SESSIONNAME", "Console")
+    _running(windows)
 
-    report = "\n".join(ce.report_lines())
+    env = ce.collect()
+    report = "\n".join(env.report_lines())
 
-    assert "ограничений, которые мешают записи, не найдено" in report
-    assert "ВНИМАНИЕ" not in report
+    assert env.station == ""
+    assert env.station_settings == []
+    assert "станция" not in report
+    assert "согласовано с клиентом" not in report
 
 
 def test_non_windows_collects_nothing(windows) -> None:
@@ -113,16 +181,26 @@ def test_non_windows_collects_nothing(windows) -> None:
     env = ce.collect()
 
     assert env.policies == []
+    assert env.station_settings == []
+    assert env.negotiated == []
     assert env.privacy == []
     assert env.services == []
 
 
+def test_station_name_helper() -> None:
+    assert ce._station_name("RDP-Tcp#32") == "RDP-Tcp"
+    assert ce._station_name("Console") == ""
+    assert ce._station_name("") == ""
+
+
 def test_summary_lines_are_compact(windows) -> None:
-    _policy(windows, "HKCU", "DisableAudioPlayback", "1")
+    _policy(windows, "HKCU", "fDisableAudioPlayback", "1")
+    _station(windows, "AudioEnumeratorDll", "rdpendp.dll")
     windows["services"] = {"Audiosrv": "запущена"}
 
     lines = ce.summary_lines()
 
-    assert lines[0] == "Политика RDP: HKCU DisableAudioPlayback=1"
-    assert lines[1] == "Доступ к микрофону: не задан"
-    assert lines[2] == "Службы звука: Audiosrv=запущена"
+    assert lines[0] == "Политика RDP: HKCU fDisableAudioPlayback=1"
+    assert lines[1] == "Станция RDP: AudioEnumeratorDll=rdpendp.dll"
+    assert lines[2] == "Доступ к микрофону: не задан"
+    assert lines[3] == "Службы звука: Audiosrv=запущена"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from voicetyper.native_audio import (
     _AUTOCONVERTPCM,
+    CaptureError,
+    _attempt_details,
     _detect_sample_format,
     _hresult_text,
     format_candidates,
@@ -94,3 +96,33 @@ def test_format_candidates_work_without_mix_format() -> None:
 def test_hresult_text_names_invalid_argument() -> None:
     assert "0x80070057" in _hresult_text(0x80070057)
     assert "E_INVALIDARG" in _hresult_text(0x80070057)
+
+
+def test_attempt_details_keeps_every_variant() -> None:
+    errors = [
+        CaptureError(
+            "Initialize [формат устройства, буфер 0: 44100 Гц]: E_INVALIDARG",
+            step="Initialize",
+            hresult=0x80070057,
+            variant="формат устройства, буфер 0",
+        ),
+        CaptureError(
+            "Initialize [PCM16 16 кГц, моно: 16000 Гц]: E_INVALIDARG",
+            step="Initialize",
+            hresult=0x80070057,
+            variant="PCM16 16 кГц, моно",
+        ),
+        CaptureError(
+            "GetService: AUDCLNT_E_UNSUPPORTED_FORMAT",
+            step="GetService",
+            hresult=0x88890008,
+            variant="формат устройства",
+        ),
+        RuntimeError("Activate: доступ отказал"),
+    ]
+
+    details = _attempt_details(errors)
+
+    assert "формат устройства, буфер 0, PCM16 16 кГц, моно" in details
+    assert "(AUDCLNT_E_UNSUPPORTED_FORMAT) → формат устройства" in details
+    assert "Activate: доступ отказал" in details

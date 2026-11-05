@@ -80,7 +80,7 @@ def _hresult_text(value: int) -> str:
 
 
 class CaptureError(RuntimeError):
-    """Capture failed with an optional step name and HRESULT."""
+    """Capture failed with an optional step name, HRESULT and format variant."""
 
     def __init__(
         self,
@@ -88,10 +88,35 @@ class CaptureError(RuntimeError):
         *,
         step: str | None = None,
         hresult: int | None = None,
+        variant: str | None = None,
     ) -> None:
         self.step = step
         self.hresult = hresult
+        self.variant = variant
         super().__init__(message)
+
+
+def _attempt_details(errors: list[BaseException]) -> str:
+    """Group every failed variant by HRESULT — none of them may be hidden.
+
+    The RDP "Remote Audio" endpoint answers GetMixFormat but refuses every
+    Initialize call; showing only the last error made a blocked endpoint look
+    like a format problem.
+    """
+    groups: dict[str, list[str]] = {}
+    loose: list[str] = []
+    for error in errors:
+        code = getattr(error, "hresult", None)
+        if code is None:
+            loose.append(str(error))
+            continue
+        variant = getattr(error, "variant", None) or str(error)
+        groups.setdefault(_hresult_text(code), []).append(variant)
+    parts = [
+        f"{hresult} → {', '.join(variants)}" for hresult, variants in groups.items()
+    ]
+    parts.extend(loose)
+    return "; ".join(parts)
 
 
 def _check(hr: int, step: str) -> None:
@@ -481,6 +506,7 @@ if HAS_MEDIA_FOUNDATION:
                     f"Initialize [{spec.summary()}]: {_hresult_text(code)}",
                     step="Initialize",
                     hresult=code,
+                    variant=spec.label,
                 )
             self.samplerate = spec.rate
             self.channelmap = list(range(spec.channels))
@@ -653,7 +679,7 @@ if HAS_MEDIA_FOUNDATION:
                 except Exception:
                     pass
 
-        details = "; ".join(str(error) for error in errors[-6:])
+        details = _attempt_details(errors)
         raise CaptureError(
             "не удалось открыть поток"
             + (f": {details}" if details else "")

@@ -289,9 +289,15 @@ ruff check .
    список аудиоустройств перечитывается.
 7. `VoiceTyper.exe --audio-test` кроме микрофонов проверяет причины, по которым
    Windows может блокировать запись, и пишет их в раздел «Ограничения записи
-   Windows»: политику перенаправления звука RDP (`DisableAudioCapture`,
-   `DisableAudioPlayback`), доступ к микрофону (ConsentStore, включая ключ
+   Windows»: политику перенаправления звука RDP (`fDisableAudioCapture`,
+   `fDisableAudioPlayback` в ключах политик и в живых настройках станции
+   `SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\<станция>`,
+   включая `AudioEnumeratorDll`), что согласовал клиент (`CLIENTAUDIO*` в
+   `HKCU\Volatile Environment`), доступ к микрофону (ConsentStore, включая ключ
    `NonPackaged` для приложений рабочего стола) и состояние служб `Audiosrv` и
    `AudioEndpointBuilder`. Каждый незакрытый формат устройства перечислен целиком,
    а не только последняя ошибка — так видно, «нет подходящего формата» или
-   «endpoint не активируется». Те же проверки сокращённо попадают в `--diagnostics`.
+   «endpoint не активируется». В конце отчёта раздел «Вывод» объясняет простыми
+   словами, что означают собранные признаки и что именно чинить. Те же проверки
+   сокращённо попадают в `--diagnostics`, а найденная блокировка — в сообщение
+   об ошибке в трее.
