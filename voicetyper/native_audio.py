@@ -269,6 +269,8 @@ class _CaptureFormat:
         if self.flags & _NOPERSIST:
             flags.append("nopersist")
         flag_text = "+".join(flags) if flags else "без флагов"
+        if self.share_mode == _EXCLUSIVE_MODE:
+            flag_text += ", монопольный"
         return (
             f"{self.label}: {self.rate} Гц, {self.channels} кан., "
             f"{self.bits} бит, {self.sample_format}, {flag_text}"
@@ -365,7 +367,13 @@ def format_candidates(
 
     def add(spec: _CaptureFormat) -> None:
         if spec.raw is not None:
-            key: tuple[object, ...] = ("mix", spec.raw, spec.flags, spec.buffer_hns)
+            key: tuple[object, ...] = (
+                "mix",
+                spec.raw,
+                spec.flags,
+                spec.buffer_hns,
+                spec.share_mode,
+            )
         else:
             key = (
                 spec.tag,
@@ -374,6 +382,7 @@ def format_candidates(
                 spec.bits,
                 spec.flags,
                 spec.buffer_hns,
+                spec.share_mode,
             )
         if key in seen:
             return
@@ -453,6 +462,30 @@ def format_candidates(
             )
         )
 
+    # Some virtual endpoints only allow exclusive mode. Try it last so that a
+    # shared stream still wins when both work.
+    if mix is not None:
+        add(
+            _from_mix(
+                mix,
+                label="формат устройства (монопольный режим)",
+                flags=0,
+                buffer_hns=1_000_000,
+                share_mode=_EXCLUSIVE_MODE,
+            )
+        )
+        channels = min(mix.channels, 2)
+        add(
+            _pcm16(
+                f"PCM16 {mix.rate} Гц, {channels} кан. (монопольный режим)",
+                mix.rate,
+                channels,
+                0,
+                1_000_000,
+                share_mode=_EXCLUSIVE_MODE,
+            )
+        )
+
     return candidates
 
 
@@ -493,7 +526,7 @@ if HAS_MEDIA_FOUNDATION:
             self._format_memory = _build_format(spec)
             hr = self._ptr[0][0].lpVtbl.Initialize(
                 self._ptr[0],
-                _SHARED_MODE,
+                spec.share_mode,
                 spec.flags,
                 spec.buffer_hns,
                 0,

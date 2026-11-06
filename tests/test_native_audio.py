@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from voicetyper.native_audio import (
     _AUTOCONVERTPCM,
+    _EXCLUSIVE_MODE,
     CaptureError,
     _attempt_details,
     _detect_sample_format,
@@ -91,6 +92,16 @@ def test_format_candidates_work_without_mix_format() -> None:
     assert candidates
     assert all(candidate.raw is None for candidate in candidates)
     assert any(candidate.flags & _AUTOCONVERTPCM for candidate in candidates)
+
+
+def test_format_candidates_try_exclusive_mode_last() -> None:
+    mix = parse_mix_format(_format(0xFFFE, 32, FLOAT_GUID))
+
+    candidates = format_candidates(mix, preferred_rate=16000)
+
+    assert any(candidate.share_mode == _EXCLUSIVE_MODE for candidate in candidates)
+    assert candidates[-1].share_mode == _EXCLUSIVE_MODE
+    assert "монопольный" in candidates[-1].summary()
 
 
 def test_hresult_text_names_invalid_argument() -> None:
