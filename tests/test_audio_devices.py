@@ -15,6 +15,7 @@ def _disable_soundcard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the PortAudio tests away from real Media Foundation hardware."""
     monkeypatch.setattr(audio, "HAS_SOUNDCARD", False)
     monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", False)
+    audio._reset_capture_cache()
 
 
 class FakeStream:
@@ -679,3 +680,117 @@ def test_media_foundation_fallback_when_portaudio_fails(
     assert session._native_thread is not None
     assert session._native_mic_name == "Удалённое аудио"
     session.stop()
+
+
+def test_last_working_capture_configuration_is_tried_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    first = audio.RecordingSession(Config())
+    first.start()
+    opened = fake.opened[-1]
+    first.stop()
+
+    fake.opened.clear()
+    second = audio.RecordingSession(Config())
+    second.start()
+    second.stop()
+
+    # The remembered (device, rate, channels) is opened immediately instead of
+    # walking the rejected candidates again.
+    assert fake.opened[0] == opened
+
+
+def test_remembered_configuration_is_ignored_for_another_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    first = audio.RecordingSession(Config())
+    first.start()
+    first.stop()
+
+    fake.opened.clear()
+    other = audio.RecordingSession(Config(input_device=14, server_microphone=True))
+    other.start()
+    other.stop()
+
+    assert fake.opened[0][0] != 9
+
+
+def test_expired_capture_configuration_is_probed_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    # A remembered mono configuration that has aged out must not be used: the
+    # normal search opens the first candidate (stereo) instead.
+    audio._remember_capture(None, 9, 44100, 1, False)
+    stale = audio._last_capture
+    audio._last_capture = (stale[0] - audio._CAPTURE_CACHE_SECONDS - 1, *stale[1:])
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    try:
+        assert fake.opened[0] == (9, 44100, 2)
+    finally:
+        session.stop()
+
+
+def test_capture_mismatch_reports_a_replacement_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The configured device cannot be opened, so another one is used instead.
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    fake.failing_devices = {10}
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config(input_device=10, server_microphone=True))
+    session.start()
+    try:
+        assert session.capture_mismatch() == session._device_name
+    finally:
+        session.stop()
+
+
+def test_capture_mismatch_accepts_the_configured_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config(input_device=9))
+    session.start()
+    try:
+        assert session.capture_mismatch() is None
+    finally:
+        session.stop()
+
+
+def test_capture_mismatch_accepts_the_wasapi_twin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same physical microphone opened through its WASAPI entry is not a
+    # fallback to something else.
+    devices = [
+        _device(1, "Микрофон (USB PnP Audio Device)", hostapi=0),
+        _device(2, "Микрофон (USB PnP Audio Device)", hostapi=1, rate=48000.0),
+    ]
+    fake = FakeSoundDevice(devices, default_index=1, wasapi_default=2, failing_devices={1})
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config(input_device=1))
+    session.start()
+    try:
+        assert session._stream.device == 2
+        assert session.capture_mismatch() is None
+    finally:
+        session.stop()

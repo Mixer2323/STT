@@ -527,6 +527,80 @@ def resolve_input_device(value: int | str | None) -> Optional[int]:
     return _system_default_input()
 
 
+def configured_device_name(value: int | str | None) -> str:
+    """Name of the microphone the settings point at, or "" when it is gone."""
+    if value in (None, "") or isinstance(value, bool):
+        return ""
+    devices = list_input_devices()
+    if isinstance(value, int):
+        for device in devices:
+            if device.index == value:
+                return device.name
+        return ""
+    needle = str(value).strip().casefold()
+    if not needle:
+        return ""
+    for device in devices:
+        if device.name.casefold() == needle:
+            return device.name
+    partial = [device for device in devices if needle in device.name.casefold()]
+    return partial[0].name if len(partial) == 1 else ""
+
+
+# The last capture configuration that actually opened. Trying it first skips
+# the rejected candidates, which is what makes every press after the first one
+# start recording noticeably sooner (Bluetooth endpoints are especially slow).
+# The entry expires so a microphone that comes back (a USB headset plugged in,
+# an RDP session reconnected) is probed again after a pause in dictation.
+_CAPTURE_CACHE_SECONDS = 60.0
+_last_capture: Optional[
+    tuple[float, int | str | None, Optional[int], int, int, bool]
+] = None
+_last_capture_lock = threading.Lock()
+
+
+def _remember_capture(
+    configured: int | str | None,
+    device: Optional[int],
+    rate: int,
+    channels: int,
+    exclusive: bool,
+) -> None:
+    global _last_capture
+    with _last_capture_lock:
+        _last_capture = (
+            time.monotonic(),
+            configured,
+            device,
+            rate,
+            channels,
+            exclusive,
+        )
+
+
+def _recall_capture() -> Optional[tuple[int | str | None, Optional[int], int, int, bool]]:
+    global _last_capture
+    with _last_capture_lock:
+        cached = _last_capture
+        if cached is None:
+            return None
+        if time.monotonic() - cached[0] > _CAPTURE_CACHE_SECONDS:
+            _last_capture = None
+            return None
+        return cached[1:]
+
+
+def _forget_capture() -> None:
+    global _last_capture
+    with _last_capture_lock:
+        _last_capture = None
+
+
+def _reset_capture_cache() -> None:
+    """Forget the remembered configuration (used by tests and diagnostics)."""
+    _forget_capture()
+
+
 def _no_input_device_message() -> str:
     message = "Микрофоны не найдены"
     if is_remote_session():
@@ -746,6 +820,8 @@ class RecordingSession:
         self._native_stop: Optional[threading.Event] = None
         self._native_error: Optional[BaseException] = None
         self._native_mic_name = ""
+        self._device_index: Optional[int] = None
+        self._device_name = ""
 
     @property
     def is_recording(self) -> bool:
@@ -853,6 +929,45 @@ class RecordingSession:
         device_index = resolve_input_device(self.cfg.input_device)
         last_error: Optional[BaseException] = None
 
+        cached = _recall_capture()
+        if cached is not None and cached[0] == self.cfg.input_device:
+            _, cached_device, cached_rate, cached_channels, cached_exclusive = cached
+            try:
+                stream = self._open_stream(
+                    cached_device,
+                    cached_rate,
+                    cached_channels,
+                    exclusive=cached_exclusive,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Сохранённые настройки микрофона не подошли (%s, %d Гц, %d кан.): %s",
+                    cached_device if cached_device is not None else "default",
+                    cached_rate,
+                    cached_channels,
+                    exc,
+                )
+                _forget_capture()
+            else:
+                logger.info(
+                    "Микрофон открыт (сохранённые настройки): устройство=%s (%s), "
+                    "%d Гц, каналов=%d, %s",
+                    cached_device if cached_device is not None else "default",
+                    _hostapi_name(cached_device) or "default host API",
+                    cached_rate,
+                    cached_channels,
+                    "exclusive" if cached_exclusive else "shared",
+                )
+                # Keep the entry fresh while dictation is active.
+                _remember_capture(
+                    self.cfg.input_device,
+                    cached_device,
+                    cached_rate,
+                    cached_channels,
+                    cached_exclusive,
+                )
+                return stream, cached_rate, cached_channels, cached_device
+
         for attempt in range(2):
             if attempt:
                 if not refresh_input_devices():
@@ -901,6 +1016,9 @@ class RecordingSession:
                             rate,
                             channels,
                             "exclusive" if exclusive else "shared",
+                        )
+                        _remember_capture(
+                            self.cfg.input_device, candidate, rate, channels, exclusive
                         )
                         if _is_server_side_fallback(candidate):
                             logger.warning(
@@ -1098,6 +1216,8 @@ class RecordingSession:
                     raise
                 self._started = True
                 self._stopped = False
+                self._device_index = None
+                self._device_name = self._native_mic_name
                 logger.info(
                     "Запись начата через Windows Media Foundation: устройство=%s, "
                     "%d Гц, каналов=%d",
@@ -1109,6 +1229,8 @@ class RecordingSession:
             self._stream = stream
             self._capture_rate = rate
             self._capture_channels = channels
+            self._device_index = device_index
+            self._device_name = _device_name(device_index)
             self._started = True
             self._stopped = False
         logger.info(
@@ -1117,6 +1239,21 @@ class RecordingSession:
             self._capture_rate,
             self._capture_channels,
         )
+
+    def capture_mismatch(self) -> Optional[str]:
+        """Name of the opened microphone when it is not the configured one.
+
+        The automatic fallback keeps dictation working when the saved device
+        disappears, but silently recording from another microphone is exactly
+        what makes the first words land in the wrong place, so the app warns.
+        """
+        configured = self.cfg.input_device
+        if configured in (None, "") or not self._device_name:
+            return None
+        requested = configured_device_name(configured)
+        if requested and _same_device_name(requested, self._device_name):
+            return None
+        return self._device_name
 
     def _callback(self, indata, frames, _time_info, status) -> None:
         if status:

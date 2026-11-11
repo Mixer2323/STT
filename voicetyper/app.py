@@ -401,8 +401,25 @@ class VoiceTyperApp:
             self._recording = session
             self._target = target
 
-        self._start_preview(session)
+        # Show "REC" as soon as the stream is open: creating the preview below
+        # can wait for the engine, and the indicator must not lag behind capture.
         self.tray.set_state(STATUS_RECORDING, "")
+        self._warn_about_capture_device(session)
+        self._start_preview(session)
+
+    def _warn_about_capture_device(self, session: RecordingSession) -> None:
+        """Tell the user when the configured microphone was silently replaced."""
+        opened = session.capture_mismatch()
+        if not opened:
+            return
+        logger.warning("Настроенный микрофон недоступен — запись идёт с «%s»", opened)
+        self.notifier.notify(
+            "Микрофон",
+            f"Настроенный микрофон не открылся — запись идёт с «{opened}». "
+            "Проверьте выбор микрофона в настройках.",
+            key="mic-fallback",
+            cooldown=300.0,
+        )
 
     def stop_recording(self) -> None:
         with self._recording_lock:
@@ -413,17 +430,27 @@ class VoiceTyperApp:
         if session is None:
             return
 
-        result = session.stop()
+        try:
+            result = session.stop()
+        except Exception as exc:
+            logger.exception("Не удалось остановить запись")
+            self._stop_preview()
+            self._flash_error(f"Не удалось остановить запись: {exc}", "Запись")
+            return
         self._stop_preview()
 
         if result.error:
             logger.info("Запись не отправлена: %s", result.error)
             if result.silent:
                 self.notifier.notify("Запись", result.error, key="silent", cooldown=3.0)
+                # Nothing was submitted, so no pipeline event will clear the
+                # "REC" indicator: put the idle state back right here.
+                self._restore_tray_state()
             else:
                 self._flash_error(result.error, "Запись")
             return
         if result.path is None:
+            self._restore_tray_state()
             return
         if self._pipeline is None:
             try:
