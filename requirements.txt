@@ -13,6 +13,9 @@ pillow>=11
 numpy>=1.26,<2
 onnxruntime>=1.17,<2
 psutil>=5.9
+# Higher-quality resampling for 44.1/48 kHz microphones; the linear fallback
+# aliases high frequencies into the speech band.
+soxr>=0.3.7
 
 # GigaAM v3 (Russian STT, ONNX models are downloaded on first use)
 gigastt==2.22.0

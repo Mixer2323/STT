@@ -639,6 +639,8 @@ def save_wav(path: Path | str, data: np.ndarray, sample_rate: int) -> Path:
 def _frame_rms(data: np.ndarray, frame_size: int) -> np.ndarray:
     if data.size == 0:
         return np.zeros(0, dtype=np.float32)
+    # A recording may be shorter than one frame (a very short hotkey tap).
+    frame_size = max(1, min(int(frame_size), data.size))
     count = max(1, data.size // frame_size)
     trimmed = data[: count * frame_size].reshape(count, frame_size)
     return np.sqrt(np.mean(np.square(trimmed, dtype=np.float32), axis=1))
@@ -809,9 +811,12 @@ class RecordingSession:
         from a headset hundreds of kilometres away, so they are only tried when
         the user says the microphone really is plugged into this computer.
         """
+        # Mixers, loopback and the MME "Sound Mapper" pseudo-devices are not
+        # microphones: they are hidden in the device list, so opening them
+        # automatically would record system audio or silence instead of speech.
         wasapi_devices = [
             device.index
-            for device in list_input_devices()
+            for device in _usable_input_devices()
             if "wasapi" in device.hostapi.casefold()
         ]
         wasapi_default = _wasapi_default_input()
@@ -1483,6 +1488,9 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
                 opened_labels.append(f"[{device.index}] {device.name}")
                 if not redirected:
                     local_opened.append(f"[{device.index}] {device.name}")
+                with session._lock:
+                    session._chunks.clear()
+                    session._frames = 0
                 break
             count = len(errors)
             label = "формат" if count == 1 else "форматов"

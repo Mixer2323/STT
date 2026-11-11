@@ -134,9 +134,11 @@ def _extract(
                 continue
             name = info.filename
             path = Path(name)
-            if path.is_absolute() or len(path.parts) != 1 or ".." in path.parts:
+            if path.is_absolute() or ".." in path.parts:
                 raise DownloadError(f"Недопустимый путь в архиве {pack.asset}: {name}")
-            if name not in expected:
+            if len(path.parts) != 1 or name not in expected:
+                # Archive helpers (__MACOSX/, nested folders) are ignored: the
+                # files we need are stored flat and were validated above.
                 continue
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled("Загрузка отменена")

@@ -126,9 +126,16 @@ class HistoryStore:
         try:
             with self._lock, closing(self._connect()) as connection:
                 if query.strip():
-                    pattern = f"%{query.strip()}%"
+                    # Escape LIKE wildcards so "50%" and "h_llo" match literally.
+                    escaped = (
+                        query.strip()
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+                    )
+                    pattern = f"%{escaped}%"
                     rows = connection.execute(
-                        "SELECT * FROM entries WHERE text LIKE ? "
+                        "SELECT * FROM entries WHERE text LIKE ? ESCAPE '\\' "
                         "ORDER BY id DESC LIMIT ? OFFSET ?",
                         (pattern, limit, offset),
                     ).fetchall()

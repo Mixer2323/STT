@@ -4,6 +4,7 @@ import pytest
 
 from voicetyper.hotkeys import (
     HotkeyError,
+    ensure_hotkey_is_safe,
     hotkey_from_capture,
     hotkey_name_from_event,
     normalize_hotkey,
@@ -63,6 +64,14 @@ def test_hotkey_from_capture_requires_normal_key() -> None:
             hotkey_from_capture(modifiers, "left shift")
     with pytest.raises(HotkeyError):
         hotkey_from_capture(["ctrl"], "notakey")
+
+
+def test_bare_regular_key_is_refused_by_policy() -> None:
+    for keys in (["a"], ["space"], ["page up"]):
+        with pytest.raises(HotkeyError):
+            ensure_hotkey_is_safe(keys)
+    ensure_hotkey_is_safe(["f10"])
+    ensure_hotkey_is_safe(["ctrl", "alt", "space"])
 
 
 def test_hotkey_from_capture_rejects_bare_regular_key() -> None:

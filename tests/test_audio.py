@@ -37,6 +37,11 @@ def test_silence_detection_and_trimming() -> None:
     assert 0 < trimmed.size < rate * 3
 
 
+def test_trim_silence_accepts_audio_shorter_than_one_frame() -> None:
+    # A very short hotkey tap produces less than one 20 ms frame.
+    assert trim_silence(np.zeros(160, dtype=np.float32), 16000).size == 0
+
+
 def test_resampling_changes_length() -> None:
     source = _tone(seconds=0.5, rate=48000)
     converted = ReadableResampler().run(source, 48000, 16000)

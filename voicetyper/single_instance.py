@@ -66,6 +66,8 @@ class InstanceLock:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.OpenEventW.restype = wintypes.HANDLE
             kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+            kernel32.SetEvent.restype = wintypes.BOOL
             event = kernel32.OpenEventW(_EVENT_MODIFY_STATE, False, ACTIVATION_EVENT_NAME)
             if not event:
                 return False
@@ -113,6 +115,10 @@ def _acquire_windows() -> InstanceLock:
         wintypes.LPCWSTR,
     ]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.SetEvent.restype = wintypes.BOOL
 
     mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
     last_error = ctypes.get_last_error()

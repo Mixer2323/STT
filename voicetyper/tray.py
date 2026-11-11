@@ -14,7 +14,6 @@ from .constants import (
     ENGINE_LABELS,
     ENGINE_ORDER,
     LANGUAGES,
-    MULTILINGUAL_ENGINES,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_LOADING,
@@ -24,6 +23,7 @@ from .constants import (
     WHISPER_MODELS,
 )
 from .engines import describe_engines
+from .hardware import config_accepts_language
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,7 @@ class TrayController:
         self._engine: Optional[str] = None
         self._last_key = None
         self._refresh_lock = threading.Lock()
+        self._refresh_pending = False
         self._available = HAS_TRAY
 
     @property
@@ -244,10 +245,17 @@ class TrayController:
         if icon is None:
             return
         if not self._refresh_lock.acquire(blocking=False):
+            # Another thread is rebuilding the menu: ask it to run once more so
+            # the newest state is not silently lost.
+            self._refresh_pending = True
             return
         try:
-            icon.menu = self.build_menu()
-            icon.update_menu()
+            for _attempt in range(2):
+                self._refresh_pending = False
+                icon.menu = self.build_menu()
+                icon.update_menu()
+                if not self._refresh_pending:
+                    break
         except Exception:
             logger.debug("Не удалось обновить меню трея", exc_info=True)
         finally:
@@ -286,7 +294,7 @@ class TrayController:
                 )
             )
 
-        if cfg.model_type in MULTILINGUAL_ENGINES:
+        if config_accepts_language(cfg, availability):
             language_items = [
                 pystray.MenuItem(
                     _LANGUAGE_LABELS.get(code, code),

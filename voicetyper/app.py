@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import paths, single_instance
-from .audio import AudioError, RecordingSession, probe_input_devices
+from .audio import AudioError, RecordingSession, probe_input_devices, refresh_input_devices
 from .autostart import is_enabled as autostart_is_enabled
 from .autostart import is_supported as autostart_supported
 from .autostart import set_enabled as set_autostart_enabled
@@ -23,7 +23,6 @@ from .constants import (
     APP_VERSION,
     ENGINE_LABELS,
     ENGINE_ORDER,
-    MULTILINGUAL_ENGINES,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_READY,
@@ -32,7 +31,7 @@ from .constants import (
 )
 from .diagnostics import collect_diagnostics, open_folder, write_diagnostics
 from .engines import resolve_engine_name
-from .hardware import detect_hardware
+from .hardware import cached_hardware, config_accepts_language
 from .history import HistoryStore
 from .hotkeys import HotkeyError, HotkeyManager, normalize_hotkey
 from .insertion import foreground_window
@@ -196,6 +195,7 @@ class VoiceTyperApp:
         self._recording: Optional[RecordingSession] = None
         self._target = None
         self._preview: Optional[_PreviewSession] = None
+        self._preview_lock = threading.Lock()
 
         self._pipeline: Optional[TranscriptionPipeline] = None
         self._transcribing = False
@@ -245,7 +245,6 @@ class VoiceTyperApp:
     def _on_tray_ready(self, icon) -> None:
         if self._started:
             return
-        self._started = True
         if icon is not None:
             self.notifier.set_icon(icon)
 
@@ -258,6 +257,9 @@ class VoiceTyperApp:
             on_result=self._on_pipeline_result,
         )
         self.models.request(cfg=cfg)
+        # Marked ready only after the pipeline exists: a failure in between
+        # must not leave an app that records but never transcribes.
+        self._started = True
 
         if self.hotkeys.available:
             try:
@@ -449,6 +451,18 @@ class VoiceTyperApp:
                 return
         self.stop_recording()
 
+    def refresh_audio_devices(self) -> None:
+        """Re-enumerate PortAudio unless a recording is using it.
+
+        ``refresh_input_devices`` calls PortAudio's ``_terminate/_initialize``,
+        which must not run while a stream is open, so it is serialised with
+        ``start_recording`` through the same lock.
+        """
+        with self._recording_lock:
+            if self._recording is not None:
+                return
+            refresh_input_devices()
+
     def _abort_recording(self) -> None:
         with self._recording_lock:
             session = self._recording
@@ -462,7 +476,8 @@ class VoiceTyperApp:
         self._stop_preview()
 
     def _on_audio_chunk(self, chunk, sample_rate: int) -> None:
-        preview = self._preview
+        with self._preview_lock:
+            preview = self._preview
         if preview is not None:
             preview.feed(chunk, sample_rate)
 
@@ -473,12 +488,18 @@ class VoiceTyperApp:
         preview = _PreviewSession(self, self.models, session.capture_rate)
         if not preview.active:
             return
-        self._preview = preview
+        with self._preview_lock:
+            leftover = self._preview
+            self._preview = preview
+        if leftover is not None:
+            # A previous recording's preview must not keep its engine lease.
+            leftover.close()
         preview.start()
 
     def _stop_preview(self) -> None:
-        preview = self._preview
-        self._preview = None
+        with self._preview_lock:
+            preview = self._preview
+            self._preview = None
         if preview is not None:
             preview.close()
 
@@ -639,7 +660,7 @@ class VoiceTyperApp:
         self.models.request(force=True, cfg=cfg)
 
     def set_language(self, code: str) -> None:
-        if self.config_store.get().model_type not in MULTILINGUAL_ENGINES:
+        if not config_accepts_language(self.config_store.get()):
             return
         cfg = self._save(language=code)
         logger.info("Выбран язык: %s", code)
@@ -678,10 +699,11 @@ class VoiceTyperApp:
     def _save(self, **changes) -> Config:
         cfg = self.config_store.update(**changes)
         self.tray.refresh_menu()
+        self.settings.reload_if_open()
         return cfg
 
     def _resolved_engine(self, cfg: Config) -> str:
-        return resolve_engine_name(cfg, detect_hardware())
+        return resolve_engine_name(cfg, cached_hardware())
 
     def _sync_autostart(self, cfg: Config) -> None:
         if not autostart_supported():
@@ -731,7 +753,7 @@ class VoiceTyperApp:
         if not applied.streaming_preview:
             self._stop_preview()
 
-        hw = detect_hardware()
+        hw = cached_hardware()
         old_engine = resolve_engine_name(old, hw)
         new_engine = resolve_engine_name(applied, hw)
         reload = (
@@ -891,21 +913,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         limit=cfg.history_limit,
         enabled=cfg.history_enabled,
     )
-    app = VoiceTyperApp(
-        store,
-        history,
-        instance,
-        first_run=first_run and not args.minimized,
-        open_settings=args.settings,
-    )
+    app: Optional[VoiceTyperApp] = None
     try:
+        app = VoiceTyperApp(
+            store,
+            history,
+            instance,
+            first_run=first_run and not args.minimized,
+            open_settings=args.settings,
+        )
         app.run()
     except KeyboardInterrupt:
-        app.shutdown()
+        if app is not None:
+            app.shutdown()
     except Exception as exc:
         logger.exception("Не удалось запустить приложение")
         _fatal(f"Не удалось запустить {APP_TITLE}:\n{exc}")
-        app.shutdown()
+        if app is not None:
+            app.shutdown()
         return 1
     finally:
         if instance is not None:

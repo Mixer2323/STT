@@ -144,3 +144,80 @@ def test_scancode_mode_reports_an_error_when_input_is_refused(
 
     assert not result.inserted
     assert result.error
+
+
+def _stub_paste(monkeypatch: pytest.MonkeyPatch, *, snapshot, sequences):
+    monkeypatch.setattr(insertion, "_snapshot_clipboard", lambda: snapshot)
+    monkeypatch.setattr(insertion, "_copy", lambda _text: None)
+    monkeypatch.setattr(insertion, "_send_paste", lambda: None)
+    monkeypatch.setattr(insertion.time, "sleep", lambda _value: None)
+    remaining = iter(sequences)
+    monkeypatch.setattr(insertion, "_clipboard_sequence", lambda: next(remaining))
+    restored: list = []
+    monkeypatch.setattr(
+        insertion,
+        "_restore_clipboard",
+        lambda snap: restored.append(snap) or True,
+    )
+    return restored
+
+
+def test_paste_restores_images_and_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = [(8, b"DIB-BYTES"), (15, b"HDROP-FILES")]
+    restored = _stub_paste(monkeypatch, snapshot=snapshot, sequences=[5, 5])
+
+    result = insertion.insert_text(
+        "привет", Config(insert_mode="paste", paste_delay_ms=0)
+    )
+
+    assert result.inserted
+    assert result.clipboard_restored
+    assert restored == [snapshot]
+
+
+def test_paste_keeps_the_new_clipboard_when_the_target_changed_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    restored = _stub_paste(monkeypatch, snapshot=[(8, b"DIB")], sequences=[5, 9])
+
+    result = insertion.insert_text(
+        "привет", Config(insert_mode="paste", paste_delay_ms=0)
+    )
+
+    assert result.inserted
+    assert not result.clipboard_restored
+    assert restored == []
+
+
+def test_paste_does_not_snapshot_when_restore_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = []
+    monkeypatch.setattr(insertion, "_snapshot_clipboard", lambda: snapshots.append(True))
+    monkeypatch.setattr(insertion, "_copy", lambda _text: None)
+    monkeypatch.setattr(insertion, "_send_paste", lambda: None)
+    monkeypatch.setattr(insertion.time, "sleep", lambda _value: None)
+    monkeypatch.setattr(insertion, "_clipboard_sequence", lambda: 5)
+    restored = []
+    monkeypatch.setattr(
+        insertion,
+        "_restore_clipboard",
+        lambda snap: restored.append(snap) or True,
+    )
+
+    result = insertion.insert_text(
+        "привет",
+        Config(insert_mode="paste", restore_clipboard=False, paste_delay_ms=0),
+    )
+
+    assert result.inserted
+    assert not result.clipboard_restored
+    assert snapshots == []
+    assert restored == []
+
+
+def test_clipboard_snapshot_requires_win32(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(insertion, "_user32", lambda: None)
+
+    assert insertion._snapshot_clipboard() is None
+    assert insertion._restore_clipboard([(8, b"DIB")]) is False

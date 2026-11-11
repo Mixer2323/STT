@@ -66,6 +66,21 @@ def test_extract_rejects_paths_outside_target(tmp_path: Path) -> None:
         model_packs._extract(archive_path, tmp_path / "target", pack, None)
 
 
+def test_extract_ignores_extra_archive_entries(tmp_path: Path) -> None:
+    pack = model_packs.PACKS["tone"]
+    archive_path = tmp_path / "extra.zip"
+    target = tmp_path / "target"
+    target.mkdir()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("model.onnx", b"model-bytes")
+        archive.writestr("__MACOSX/._model.onnx", b"junk")
+        archive.writestr("notes.txt", b"junk")
+
+    model_packs._extract(archive_path, target, pack, None)
+
+    assert (target / "model.onnx").read_bytes() == b"model-bytes"
+
+
 def test_extract_reports_missing_files(tmp_path: Path) -> None:
     pack = model_packs.PACKS["tone"]
     archive_path = tmp_path / "empty.zip"

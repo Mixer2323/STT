@@ -128,9 +128,6 @@ def download_file(
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 status = getattr(response, "status", 200)
-                if status == 416 and expected_size and existing == expected_size:
-                    os.replace(part, destination)
-                    break
                 if status == 200 and existing:
                     # Server ignored Range: restart from scratch.
                     existing = 0
@@ -205,6 +202,32 @@ def download_file(
                 return destination
         except DownloadCancelled:
             raise
+        except urllib.error.HTTPError as exc:
+            # urllib raises HTTPError for 416, so the status check above never
+            # sees it: a complete .part file must be promoted, not retried.
+            if (
+                exc.code == 416
+                and existing
+                and (expected_size is None or existing == expected_size)
+            ):
+                os.replace(part, destination)
+                _report(
+                    progress,
+                    DownloadProgress(
+                        destination.name, existing, existing, message="готово"
+                    ),
+                )
+                return destination
+            last_error = exc
+            logger.warning(
+                "Загрузка %s (попытка %d/%d) не удалась: %s",
+                destination.name,
+                attempt,
+                retries,
+                exc,
+            )
+            if attempt < retries:
+                time.sleep(min(2.0 * attempt, 6.0))
         except (urllib.error.URLError, TimeoutError, OSError, DownloadError) as exc:
             last_error = exc
             logger.warning(

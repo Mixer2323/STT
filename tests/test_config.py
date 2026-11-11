@@ -78,10 +78,16 @@ def test_listener_receives_validated_config(tmp_path: Path) -> None:
 
 
 def test_language_is_russian_only_without_whisper() -> None:
-    for engine in ("auto", "gigaam", "tone"):
+    for engine in ("gigaam", "tone"):
         cfg, warnings = validate_mapping({"model_type": engine, "language": "en"})
         assert cfg.language == "ru"
         assert warnings
+
+    # "auto" may resolve to Faster-Whisper, so the choice is kept; the UI locks
+    # the picker when auto resolves to a Russian-only engine.
+    auto, auto_warnings = validate_mapping({"model_type": "auto", "language": "en"})
+    assert auto.language == "en"
+    assert not auto_warnings
 
     whisper, _ = validate_mapping({"model_type": "faster_whisper", "language": "en"})
     assert whisper.language == "en"

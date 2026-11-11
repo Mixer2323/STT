@@ -202,8 +202,14 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
     choice("insert_mode", INSERT_MODES)
 
     # Only Whisper can recognise other languages; the Russian-only engines
-    # ignore the setting, so keep it pinned to "ru" for them.
-    if cfg.model_type not in MULTILINGUAL_ENGINES and cfg.language != "ru":
+    # ignore the setting, so keep it pinned to "ru" for them. "auto" is left
+    # alone: it may resolve to Faster-Whisper, and the UI decides whether the
+    # picker applies (see hardware.config_accepts_language).
+    if (
+        cfg.model_type not in MULTILINGUAL_ENGINES
+        and cfg.model_type != "auto"
+        and cfg.language != "ru"
+    ):
         if "language" in raw:
             warnings.append(
                 "Выбор языка доступен только для Faster-Whisper; установлен русский"

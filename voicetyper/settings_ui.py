@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import paths
-from .audio import HAS_SOUNDDEVICE, refresh_input_devices, visible_input_devices
+from .audio import HAS_SOUNDDEVICE, visible_input_devices
 from .config import ConfigStore
 from .constants import (
     APP_TITLE,
@@ -25,15 +25,16 @@ from .constants import (
     ENGINE_LABELS,
     ENGINE_ORDER,
     LANGUAGES,
-    MULTILINGUAL_ENGINES,
     TONE_DECODERS,
     WHISPER_MODELS,
 )
 from .engines import describe_engines
+from .hardware import config_accepts_language
 from .hotkeys import (
     HAS_KEYBOARD,
     HotkeyError,
     capture_keyboard,
+    ensure_hotkey_is_safe,
     hotkey_from_capture,
     hotkey_name_from_event,
     normalize_hotkey,
@@ -211,6 +212,8 @@ class SettingsWindow:
         self._device_values: list[object] = []
         self.vars: dict[str, tk.Variable] = {}
         self._history_entries: dict[str, object] = {}
+        self._results: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._diagnostics_pending = False
 
         self._capturing = False
         self._capture_modifiers: set[str] = set()
@@ -670,7 +673,8 @@ class SettingsWindow:
         self.diagnostics_text.configure(yscrollcommand=scroll.set)
         self.diagnostics_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        self._refresh_diagnostics()
+        self._set_diagnostics_text("Диагностика собирается…")
+        self.root.after(50, self._refresh_diagnostics)
         return 4
 
     def _build_about_tab(self) -> int:
@@ -781,7 +785,11 @@ class SettingsWindow:
         )
 
     def _update_language_options(self) -> None:
-        if self._engine_code() in MULTILINGUAL_ENGINES:
+        engine = self._engine_code()
+        multilingual = config_accepts_language(
+            dataclasses.replace(self._store.get(), model_type=engine)
+        )
+        if multilingual:
             self.language_combo.configure(
                 values=[_LANG_LABELS[code] for code in LANGUAGES], state="readonly"
             )
@@ -874,8 +882,9 @@ class SettingsWindow:
     def _refresh_devices(self) -> None:
         # PortAudio caches the device list; in an RDP session it is rebuilt
         # when the client connects, so re-enumerate before showing the list.
-        if not getattr(self._app, "is_recording", False):
-            refresh_input_devices()
+        # The app serialises this with recording so an open stream is never
+        # torn down by PortAudio's _terminate/_initialize.
+        self._app.refresh_audio_devices()
         # Kernel (WDM-KS) inputs are not what Windows shows in the session, so
         # they only belong in the list when the user says the headset really is
         # plugged into this computer.
@@ -907,6 +916,13 @@ class SettingsWindow:
         self._refresh_devices()
 
     def _select_input_device(self, value) -> None:
+        if value not in self._device_values and value is not None:
+            # A legacy name or a device hidden by "only session microphones":
+            # keep it selectable, otherwise "Применить" silently switches to
+            # the system default microphone.
+            self._device_labels.insert(1, f"недоступен: {value}")
+            self._device_values.insert(1, value)
+            self.device_combo.configure(values=self._device_labels)
         try:
             index = self._device_values.index(value)
         except ValueError:
@@ -1134,16 +1150,23 @@ class SettingsWindow:
         if self._capturing:
             self._finish_capture(None, "")
         try:
-            hotkey, _keys = normalize_hotkey(self.vars["hotkey"].get())
             base = self._store.get()
+            raw_hotkey = str(self.vars["hotkey"].get()).strip()
+            if HAS_KEYBOARD:
+                hotkey, keys = normalize_hotkey(raw_hotkey)
+                ensure_hotkey_is_safe(keys)
+            elif raw_hotkey:
+                hotkey = raw_hotkey
+            else:
+                raise ValueError("«Горячая клавиша» не задана")
             engine = dict(zip(self._engine_labels, self._engine_values, strict=True)).get(
                 self.vars["model_type"].get(), base.model_type
             )
-            language = (
-                _reverse(_LANG_LABELS).get(self.vars["language"].get(), "ru")
-                if engine in MULTILINGUAL_ENGINES
-                else "ru"
-            )
+            language = _reverse(_LANG_LABELS).get(self.vars["language"].get(), "ru")
+            if not config_accepts_language(
+                dataclasses.replace(base, model_type=engine, language=language)
+            ):
+                language = "ru"
             tone = _reverse(_TONE_LABELS).get(self.vars["tone_decoder"].get(), base.tone_decoder)
             device = _reverse(_DEVICE_LABELS).get(self.vars["device"].get(), base.device)
             compute = _reverse(_COMPUTE_LABELS).get(
@@ -1278,9 +1301,12 @@ class SettingsWindow:
             return
         if not messagebox.askyesno("Удалить", "Удалить выбранные записи?", parent=self.root):
             return
-        for iid in selection:
-            self._app.history.delete(int(iid))
+        failed = [iid for iid in selection if not self._app.history.delete(int(iid))]
         self._refresh_history()
+        if failed:
+            messagebox.showerror(
+                "История", "Не удалось удалить часть записей", parent=self.root
+            )
 
     def _clear_history(self) -> None:
         if not messagebox.askyesno(
@@ -1289,7 +1315,9 @@ class SettingsWindow:
             parent=self.root,
         ):
             return
-        self._app.history.clear()
+        if not self._app.history.clear():
+            messagebox.showerror("История", "Не удалось очистить историю", parent=self.root)
+            return
         self._refresh_history()
         self.status_var.set("История очищена")
 
@@ -1314,14 +1342,37 @@ class SettingsWindow:
 
     # -- diagnostics -----------------------------------------------------
     def _refresh_diagnostics(self) -> None:
-        try:
-            content = self._app.collect_diagnostics_text()
-        except Exception as exc:
-            content = f"Не удалось собрать диагностику: {exc}"
+        # Collecting diagnostics runs nvidia-smi and walks the model folder; it
+        # must not happen in the Tk thread or the window freezes for seconds.
+        if self._diagnostics_pending:
+            return
+        self._diagnostics_pending = True
+        self._set_diagnostics_text("Сбор диагностики…")
+
+        def collect() -> None:
+            try:
+                content = self._app.collect_diagnostics_text()
+            except Exception as exc:
+                content = f"Не удалось собрать диагностику: {exc}"
+            self._results.put(("diagnostics", content))
+
+        threading.Thread(target=collect, name="settings-diagnostics", daemon=True).start()
+
+    def _set_diagnostics_text(self, content: str) -> None:
         self.diagnostics_text.configure(state="normal")
         self.diagnostics_text.delete("1.0", "end")
         self.diagnostics_text.insert("1.0", content)
         self.diagnostics_text.configure(state="disabled")
+
+    def _drain_results(self) -> None:
+        while True:
+            try:
+                kind, content = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "diagnostics":
+                self._diagnostics_pending = False
+                self._set_diagnostics_text(content)
 
     def _copy_diagnostics(self) -> None:
         content = self.diagnostics_text.get("1.0", "end").strip()
@@ -1352,26 +1403,37 @@ class SettingsWindow:
         if not name:
             return
         index = self._tabs.get(name)
-        if index is not None:
+        if index is None:
+            return
+        if self.notebook.index(self.notebook.select()) == index:
+            # Already visible: <<NotebookTabChanged>> will not fire.
+            self._refresh_tab(name)
+        else:
             self.notebook.select(index)
-            if name == "history":
-                self._refresh_history()
-            elif name == "diagnostics":
-                self._refresh_diagnostics()
+
+    def _refresh_tab(self, name: Optional[str]) -> None:
+        if name == "history":
+            self._refresh_history()
+        elif name == "diagnostics":
+            self._refresh_diagnostics()
 
     def _on_tab_changed(self, _event=None) -> None:
         if self._capturing:
             self._finish_capture(None, "Запись комбинации отменена")
         current = self.notebook.index(self.notebook.select())
-        if current == self._tabs.get("history"):
-            self._refresh_history()
-        elif current == self._tabs.get("diagnostics"):
-            self._refresh_diagnostics()
+        for name, index in self._tabs.items():
+            if index == current:
+                self._refresh_tab(name)
+                return
 
     def _poll_commands(self) -> None:
         try:
+            self._drain_results()
             while True:
-                command = self._commands.get_nowait()
+                try:
+                    command = self._commands.get_nowait()
+                except queue.Empty:
+                    break
                 action = command[0]
                 if action == "show":
                     self.root.deiconify()
@@ -1383,15 +1445,25 @@ class SettingsWindow:
                     if len(command) > 1:
                         self.show_tab(command[1])
                 elif action == "reload":
-                    self._load_from_config()
-                    self._refresh_history()
+                    # The tray changed the config. Unapplied edits in this
+                    # window win: reloading would silently discard them.
+                    if not self._dirty:
+                        self._load_from_config()
+                        self._refresh_history()
                 elif action == "close":
                     self._finish_capture(None, "")
                     self.root.destroy()
                     return
-        except queue.Empty:
-            pass
-        self.root.after(200, self._poll_commands)
+        except Exception:
+            # A failing command must not kill the polling loop: the tray's
+            # "Настройки…"/"История…" actions and shutdown rely on it.
+            logger.exception("Ошибка обработки команды окна настроек")
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(200, self._poll_commands)
+            except Exception:
+                pass
 
     def _on_close(self) -> None:
         if self._capturing:

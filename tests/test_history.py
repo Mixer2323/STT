@@ -15,6 +15,15 @@ def test_history_add_list_search_and_limit(tmp_path: Path) -> None:
     assert store.list(limit=1)[0].text == "text 4"
 
 
+def test_search_does_not_treat_query_as_a_like_pattern(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history.db")
+    store.add("hello world")
+    store.add("h_llo")
+    assert [entry.text for entry in store.list(query="h_llo")] == ["h_llo"]
+    store.add("50% discount")
+    assert [entry.text for entry in store.list(query="50%")] == ["50% discount"]
+
+
 def test_history_can_be_disabled(tmp_path: Path) -> None:
     store = HistoryStore(tmp_path / "history.db", enabled=False)
     assert store.add("ignored") is None

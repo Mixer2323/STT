@@ -174,6 +174,20 @@ def _is_function_key(name: str) -> bool:
     return name.startswith("f") and name[1:].isdigit() and 1 <= int(name[1:]) <= 24
 
 
+def ensure_hotkey_is_safe(keys: list[str]) -> None:
+    """Refuse combinations that would hijack ordinary typing system-wide.
+
+    ``normalize_hotkey`` stays permissive (it also accepts "page up"), but a
+    single regular key is registered with ``suppress=True`` and then never
+    reaches any application again, so only F1-F24 may be used alone.
+    """
+    if len(keys) == 1 and keys[0] not in _MODIFIERS and not _is_function_key(keys[0]):
+        raise HotkeyError(
+            "Одна обычная клавиша будет перехвачена во всех приложениях — добавьте "
+            "модификатор (Ctrl/Alt/Shift/Win). Одиночные клавиши F1–F24 разрешены."
+        )
+
+
 def hotkey_name_from_event(name: str) -> str:
     """Map a keyboard event name to the token used in hotkey strings."""
     lowered = (name or "").strip().lower()
@@ -256,9 +270,10 @@ class HotkeyManager:
         with self._lock:
             if self._running:
                 return
-            self._running = True
             cfg = self._store.get()
             normalized, keys = normalize_hotkey(cfg.hotkey)
+            ensure_hotkey_is_safe(keys)
+            self._running = True
             self._keys = keys
             try:
                 self._handler = keyboard.add_hotkey(
@@ -285,6 +300,7 @@ class HotkeyManager:
         if not HAS_KEYBOARD:
             raise HotkeyError("Библиотека keyboard не установлена")
         normalized, keys = normalize_hotkey(hotkey)
+        ensure_hotkey_is_safe(keys)
         with self._lock:
             if not self._running:
                 self._bound = normalized

@@ -79,6 +79,7 @@ class TranscriptionPipeline:
         self._next_id = 1
         self._id_lock = threading.Lock()
         self._acquire_timeout = acquire_timeout
+        self._stop_lock = threading.Lock()
         self._worker.start()
 
     @property
@@ -277,13 +278,26 @@ class TranscriptionPipeline:
             logger.debug("Не удалось удалить %s", path, exc_info=True)
 
     def stop(self, timeout: float = 8.0) -> None:
-        if self._stopped.is_set():
-            return
-        self._stopped.set()
+        with self._stop_lock:
+            first = not self._stopped.is_set()
+            if first:
+                self._stopped.set()
+            self._push_sentinel()
+            if self._worker.is_alive():
+                self._worker.join(timeout=timeout)
+            if first:
+                self._drain_queue()
+            if self._worker.is_alive():
+                # The job in flight outlived the timeout: leave a sentinel so
+                # the worker can still exit once it finishes.
+                self._push_sentinel()
+        logger.info("Очередь распознавания остановлена")
+
+    def _push_sentinel(self) -> None:
         while True:
             try:
                 self._queue.put_nowait(None)
-                break
+                return
             except queue.Full:
                 try:
                     dropped = self._queue.get_nowait()
@@ -292,14 +306,13 @@ class TranscriptionPipeline:
                 if dropped is not None:
                     self._safe_unlink(dropped.path)
                 self._queue.task_done()
-        if self._worker.is_alive():
-            self._worker.join(timeout=timeout)
+
+    def _drain_queue(self) -> None:
         while True:
             try:
                 job = self._queue.get_nowait()
             except queue.Empty:
-                break
+                return
             if job is not None:
                 self._safe_unlink(job.path)
             self._queue.task_done()
-        logger.info("Очередь распознавания остановлена")

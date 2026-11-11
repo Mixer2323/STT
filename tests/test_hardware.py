@@ -103,6 +103,26 @@ def test_explicit_compute_is_downgraded_on_cpu(
     assert (device, compute) == ("cpu", "int8")
 
 
+def test_language_support_follows_the_resolved_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from voicetyper import hardware
+    from voicetyper.hardware import EngineAvailability
+
+    monkeypatch.setattr(hardware, "_ram_gb", lambda: 16.0)
+    only_whisper = {
+        "gigaam": EngineAvailability(False),
+        "tone": EngineAvailability(False),
+        "faster_whisper": EngineAvailability(True),
+    }
+    assert hardware.config_accepts_language(Config(model_type="auto"), only_whisper)
+
+    with_gigaam = dict(only_whisper)
+    with_gigaam["gigaam"] = EngineAvailability(True)
+    assert not hardware.config_accepts_language(Config(model_type="auto"), with_gigaam)
+    assert hardware.config_accepts_language(Config(model_type="faster_whisper"), with_gigaam)
+
+
 def test_non_windows_is_not_gated_by_cudnn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

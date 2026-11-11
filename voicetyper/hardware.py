@@ -12,9 +12,11 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
 from .config import Config
+from .constants import MULTILINGUAL_ENGINES
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +279,32 @@ def choose_engine_name(cfg: Config, hw: HardwareInfo, availability: dict[str, En
     if installed.get("tone") and (ram == 0 or ram >= 4):
         return "tone"
     return first_available("faster_whisper", "gigaam", "tone") or "none"
+
+
+@lru_cache(maxsize=1)
+def cached_hardware() -> HardwareInfo:
+    """Hardware snapshot cached for the process lifetime.
+
+    ``detect_hardware`` may spawn ``nvidia-smi`` (up to 6 s) and the app asks
+    for hardware on every settings change, so probe it once.
+    """
+    return detect_hardware()
+
+
+def config_accepts_language(
+    cfg: Config,
+    availability: Optional[dict[str, EngineAvailability]] = None,
+) -> bool:
+    """True when the engine this config resolves to recognises other languages.
+
+    "auto" is decided by what is installed, so the language picker must follow
+    the resolved engine (a Faster-Whisper-only machine gets the full list) and
+    not the literal ``model_type`` value.
+    """
+    if availability is None:
+        availability = engine_availability()
+    hw = HardwareInfo(cpu_cores=os.cpu_count() or 1, ram_gb=_ram_gb())
+    return choose_engine_name(cfg, hw, availability) in MULTILINGUAL_ENGINES
 
 
 def format_bytes(size: float) -> str:

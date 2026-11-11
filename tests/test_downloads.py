@@ -90,6 +90,21 @@ def test_resume_keeps_existing_bytes(server: str, tmp_path: Path) -> None:
     assert destination.read_bytes() == _Handler.payload
 
 
+def test_complete_partial_file_is_promoted(server: str, tmp_path: Path) -> None:
+    # A crash after the last byte leaves a complete .part file; the server then
+    # answers the resume request with 416 and the file must still be finished.
+    destination = tmp_path / "data.bin"
+    part = _part_path(destination, server)
+    part.write_bytes(_Handler.payload)
+    download_file(
+        server,
+        destination,
+        expected_size=len(_Handler.payload),
+        retries=1,
+    )
+    assert destination.read_bytes() == _Handler.payload
+
+
 def test_partial_file_from_another_source_is_ignored(server: str, tmp_path: Path) -> None:
     destination = tmp_path / "data.bin"
     foreign = _part_path(destination, "https://mirror.invalid/data.bin")

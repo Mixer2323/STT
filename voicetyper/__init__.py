@@ -1,14 +1,13 @@
 """VoiceTyper - local speech-to-text for Windows."""
 
-import os
 import sys
 
-# These variables must be set before huggingface_hub / tokenizers / onnxruntime
-# are imported anywhere in the process.
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+from .environment import prepare as _prepare_environment
+
+# huggingface_hub / tokenizers / onnxruntime read these on import, so they are
+# applied as early as possible: every supported entry point (voice_typer.py and
+# python -m voicetyper) imports this package before any third-party module.
+_prepare_environment()
 
 __version__ = "1.0.10"
 APP_NAME = "VoiceTyper"
