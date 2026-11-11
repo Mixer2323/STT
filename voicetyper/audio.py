@@ -167,6 +167,10 @@ def is_remote_session() -> bool:
         return False
 
 
+_DEVICE_REFRESH_SECONDS = 60.0
+_last_device_refresh = 0.0
+
+
 def refresh_input_devices() -> bool:
     """Re-enumerate PortAudio devices.
 
@@ -174,6 +178,7 @@ def refresh_input_devices() -> bool:
     set of audio devices changes when the client connects or disconnects, so
     the cached list (and the default device index) can become stale.
     """
+    global _last_device_refresh
     if not HAS_SOUNDDEVICE:
         return False
     terminate = getattr(sd, "_terminate", None)
@@ -186,6 +191,7 @@ def refresh_input_devices() -> bool:
     except Exception:
         logger.warning("Не удалось обновить список аудиоустройств", exc_info=True)
         return False
+    _last_device_refresh = time.monotonic()
     logger.debug("Список аудиоустройств обновлён")
     return True
 
@@ -604,8 +610,27 @@ def _forget_capture() -> None:
 
 
 def _reset_capture_cache() -> None:
-    """Forget the remembered configuration (used by tests and diagnostics)."""
+    """Forget remembered capture state (used by tests and diagnostics)."""
     _forget_capture()
+    _forget_media_foundation_failure()
+
+
+# A dead endpoint (the RDP "Remote Audio" stub, a disconnected headset) makes
+# Media Foundation wait for the recorder thread; the wait is capped and a recent
+# failure skips the fallback for a minute so the hotkey does not hang each time.
+_MF_READY_TIMEOUT = 4.0
+_MF_RETRY_SECONDS = 60.0
+_mf_failed_until = 0.0
+
+
+def _remember_media_foundation_failure() -> None:
+    global _mf_failed_until
+    _mf_failed_until = time.monotonic() + _MF_RETRY_SECONDS
+
+
+def _forget_media_foundation_failure() -> None:
+    global _mf_failed_until
+    _mf_failed_until = 0.0
 
 
 def _no_input_device_message() -> str:
@@ -829,6 +854,7 @@ class RecordingSession:
         self._native_mic_name = ""
         self._device_index: Optional[int] = None
         self._device_name = ""
+        self.server_side_fallback = False
 
     @property
     def is_recording(self) -> bool:
@@ -838,6 +864,11 @@ class RecordingSession:
     @property
     def capture_rate(self) -> int:
         return self._capture_rate
+
+    @property
+    def device_name(self) -> str:
+        """Name of the microphone that was actually opened."""
+        return self._device_name
 
     @property
     def result(self) -> Optional[RecordingResult]:
@@ -930,6 +961,18 @@ class RecordingSession:
         if not ordered:
             ordered.append(None)
         return ordered
+
+    def _refresh_stale_devices(self) -> None:
+        """Re-enumerate PortAudio when the cached device list may be out of date.
+
+        An RDP redirect endpoint appears (or disappears) when the client
+        connects, and the application may have been started before that, so the
+        first recording of a session re-reads the list instead of trusting the
+        one PortAudio cached at startup.
+        """
+        if time.monotonic() - _last_device_refresh < _DEVICE_REFRESH_SECONDS:
+            return
+        refresh_input_devices()
 
     def _open_first_available(self) -> tuple[object, int, int, Optional[int]]:
         assert sd is not None
@@ -1076,10 +1119,16 @@ class RecordingSession:
         """
         if not HAS_SOUNDCARD or not HAS_MEDIA_FOUNDATION or os.name != "nt":
             return False
+        if time.monotonic() < _mf_failed_until:
+            logger.debug(
+                "Media Foundation недавно не смог открыть микрофон — попытка пропущена"
+            )
+            return False
         device_index = resolve_input_device(self.cfg.input_device)
         microphone = _find_soundcard_microphone(self._native_capture_names(device_index))
         if microphone is None:
             logger.warning("Windows Media Foundation не нашёл ни одного микрофона")
+            _remember_media_foundation_failure()
             return False
 
         stop_event = threading.Event()
@@ -1097,10 +1146,11 @@ class RecordingSession:
         )
         self._native_thread = thread
         thread.start()
-        if not ready.wait(timeout=10.0):
+        if not ready.wait(timeout=_MF_READY_TIMEOUT):
             logger.warning("Windows Media Foundation не успел открыть микрофон")
             stop_event.set()
             self._native_thread = None
+            _remember_media_foundation_failure()
             return False
         if self._native_error is not None:
             logger.warning(
@@ -1109,7 +1159,9 @@ class RecordingSession:
                 self._native_error,
             )
             self._native_thread = None
+            _remember_media_foundation_failure()
             return False
+        _forget_media_foundation_failure()
         return True
 
     def _native_capture_loop(
@@ -1218,6 +1270,7 @@ class RecordingSession:
         with self._lock:
             if self._started:
                 return
+            self._refresh_stale_devices()
             try:
                 stream, rate, channels, device_index = self._open_first_available()
             except AudioError:
@@ -1240,6 +1293,7 @@ class RecordingSession:
             self._capture_channels = channels
             self._device_index = device_index
             self._device_name = _device_name(device_index)
+            self.server_side_fallback = _is_server_side_fallback(device_index)
             self._started = True
             self._stopped = False
         logger.info(

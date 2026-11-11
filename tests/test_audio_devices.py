@@ -16,6 +16,7 @@ def _disable_soundcard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(audio, "HAS_SOUNDCARD", False)
     monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", False)
     audio._reset_capture_cache()
+    monkeypatch.setattr(audio, "_last_device_refresh", time.monotonic())
 
 
 class FakeStream:
@@ -846,6 +847,106 @@ def test_warm_up_reports_an_unavailable_microphone(
     monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", False)
 
     assert audio.warm_up_microphone(Config(), settle=0) is False
+
+
+def test_stale_device_list_is_refreshed_before_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    # The app may have started before the RDP client created the endpoint.
+    monkeypatch.setattr(
+        audio,
+        "_last_device_refresh",
+        time.monotonic() - audio._DEVICE_REFRESH_SECONDS - 1,
+    )
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    session.stop()
+
+    assert fake.refreshed == 1
+
+
+def test_fresh_device_list_is_not_refreshed_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    session.stop()
+
+    assert fake.refreshed == 0
+
+
+def test_server_side_fallback_flags_the_opened_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+
+    server = audio.RecordingSession(Config(input_device=14, server_microphone=True))
+    server.start()
+    try:
+        assert server.server_side_fallback
+    finally:
+        server.stop()
+
+    redirected = audio.RecordingSession(Config(input_device=9))
+    redirected.start()
+    try:
+        assert not redirected.server_side_fallback
+    finally:
+        redirected.stop()
+
+
+def test_media_foundation_is_skipped_after_a_recent_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [_device(9, "Удалённое аудио", hostapi=1, channels=1, rate=44100.0)]
+    fake = FakeSoundDevice(
+        devices, default_index=9, wasapi_default=9, failing_devices={9}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", True)
+    audio._remember_media_foundation_failure()
+    probed = []
+    monkeypatch.setattr(
+        audio, "_find_soundcard_microphone", lambda names: probed.append(names)
+    )
+
+    with pytest.raises(audio.AudioError):
+        audio.RecordingSession(Config()).start()
+
+    assert probed == []
+
+
+def test_media_foundation_failure_is_remembered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = [_device(9, "Удалённое аудио", hostapi=1, channels=1, rate=44100.0)]
+    fake = FakeSoundDevice(
+        devices, default_index=9, wasapi_default=9, failing_devices={9}
+    )
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", True)
+    monkeypatch.setattr(audio, "_find_soundcard_microphone", lambda names: None)
+    audio._reset_capture_cache()
+
+    with pytest.raises(audio.AudioError):
+        audio.RecordingSession(Config()).start()
+
+    assert audio._mf_failed_until > time.monotonic()
 
 
 def test_capture_mismatch_accepts_the_wasapi_twin(monkeypatch: pytest.MonkeyPatch) -> None:

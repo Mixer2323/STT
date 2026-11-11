@@ -60,7 +60,8 @@ def test_lowercase_uses_the_physical_scan_code(monkeypatch: pytest.MonkeyPatch) 
 
     assert insertion.type_scancodes("и", delay_ms=0)
 
-    assert user32.batches == [[(0x42, 48, 0), (0x42, 48, insertion._KEYEVENTF_KEYUP)]]
+    scan = insertion._KEYEVENTF_SCANCODE
+    assert user32.batches == [[(0, 48, scan), (0, 48, scan | insertion._KEYEVENTF_KEYUP)]]
 
 
 def test_capital_letters_press_shift_with_a_scan_code(
@@ -72,7 +73,27 @@ def test_capital_letters_press_shift_with_a_scan_code(
     insertion.type_scancodes("Ф", delay_ms=0)
 
     up = insertion._KEYEVENTF_KEYUP
-    assert user32.batches == [[(0x10, 42, 0), (0x41, 30, 0), (0x41, 30, up), (0x10, 42, up)]]
+    scan = insertion._KEYEVENTF_SCANCODE
+    assert user32.batches == [
+        [(0, 42, scan), (0, 30, scan), (0, 30, scan | up), (0, 42, scan | up)]
+    ]
+
+
+def test_ctrl_v_uses_scan_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # RDP forwards physical keys, so the paste shortcut must not rely on wVk.
+    user32 = FakeUser32()
+    monkeypatch.setattr(insertion, "_user32", lambda: user32)
+
+    assert insertion._send_ctrl_v_win32()
+
+    up = insertion._KEYEVENTF_KEYUP
+    scan = insertion._KEYEVENTF_SCANCODE
+    assert user32.batches[-1] == [
+        (0, 0x1D, scan),
+        (0, 0x2F, scan),
+        (0, 0x2F, scan | up),
+        (0, 0x1D, scan | up),
+    ]
 
 
 def test_keys_that_would_be_shortcuts_are_injected_as_unicode(
@@ -132,7 +153,10 @@ def test_scancode_mode_never_touches_the_clipboard(
     assert result.method == "type_scancode"
     assert result.error is None
     assert len(user32.batches) == 2
-    assert [event[1] for batch in user32.batches for event in batch if event[0]] == [48, 48, 30, 30]
+    scan = insertion._KEYEVENTF_SCANCODE
+    assert [
+        event[1] for batch in user32.batches for event in batch if event[2] & scan
+    ] == [48, 48, 30, 30]
 
 
 def test_scancode_mode_reports_an_error_when_input_is_refused(

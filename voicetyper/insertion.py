@@ -390,17 +390,22 @@ def _send_ctrl_v_win32() -> bool:
     if user32 is None:
         return False
     try:
+        hkl = _active_keyboard_layout(user32)
+        # Scan codes, not virtual keys: the RDP client forwards physical keys,
+        # and KEYEVENTF_SCANCODE tells Windows to use wScan and ignore wVk.
+        ctrl_scan = int(user32.MapVirtualKeyExW(_VK_CONTROL, _MAPVK_VK_TO_VSC, hkl)) or 0x1D
+        v_scan = int(user32.MapVirtualKeyExW(_VK_V, _MAPVK_VK_TO_VSC, hkl)) or 0x2F
         events = (_INPUT * 4)()
         definitions = (
-            (_VK_CONTROL, 0),
-            (_VK_V, 0),
-            (_VK_V, _KEYEVENTF_KEYUP),
-            (_VK_CONTROL, _KEYEVENTF_KEYUP),
+            (ctrl_scan, _KEYEVENTF_SCANCODE),
+            (v_scan, _KEYEVENTF_SCANCODE),
+            (v_scan, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP),
+            (ctrl_scan, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP),
         )
-        for event, (vk, flags) in zip(events, definitions, strict=True):
+        for event, (scan, flags) in zip(events, definitions, strict=True):
             event.type = _INPUT_KEYBOARD
-            event.union.ki.wVk = vk
-            event.union.ki.wScan = 0
+            event.union.ki.wVk = 0
+            event.union.ki.wScan = scan
             event.union.ki.dwFlags = flags
         sent = user32.SendInput(4, events, ctypes.sizeof(_INPUT))
         return sent == 4
@@ -419,15 +424,17 @@ def _send_paste() -> None:
 # ---------------------------------------------------------------------------
 # Scan-code typing
 #
-# SendInput with wScan == 0 produces WM_KEYDOWN/WM_CHAR locally, but the Remote
+# SendInput with wVk and no flags produces a virtual-key event; the Remote
 # Desktop client only forwards events that carry a real hardware scan code, so
-# keystrokes injected into an RDP session have to emulate physical keys and let
-# the remote layout translate them. That is also why no clipboard is touched.
+# keystrokes injected into an RDP session must set KEYEVENTF_SCANCODE (wScan is
+# used, wVk is ignored) and emulate physical keys, letting the remote layout
+# translate them. That is also why no clipboard is touched.
 # ---------------------------------------------------------------------------
 _VK_SHIFT = 0x10
 _VK_RETURN = 0x0D
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_SCANCODE = 0x0008
 _MAPVK_VK_TO_VSC = 0
 _MAPVK_VK_TO_VSC_EX = 4
 _STATE_SHIFT = 0x01
@@ -562,14 +569,17 @@ def type_scancodes(text: str, *, delay_ms: int = 12) -> bool:
             if key is None:
                 events = _unicode_events(symbol)
             else:
-                vk, scan, flags, needs_shift = key
+                _vk, scan, flags, needs_shift = key
+                flags |= _KEYEVENTF_SCANCODE
                 events = []
                 if needs_shift:
-                    events.append((_VK_SHIFT, shift_scan, 0))
-                events.append((vk, scan, flags))
-                events.append((vk, scan, flags | _KEYEVENTF_KEYUP))
+                    events.append((0, shift_scan, _KEYEVENTF_SCANCODE))
+                events.append((0, scan, flags))
+                events.append((0, scan, flags | _KEYEVENTF_KEYUP))
                 if needs_shift:
-                    events.append((_VK_SHIFT, shift_scan, _KEYEVENTF_KEYUP))
+                    events.append(
+                        (0, shift_scan, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP)
+                    )
             if not _send_events(user32, events):
                 return False
             if delay:

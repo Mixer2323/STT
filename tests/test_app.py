@@ -94,9 +94,36 @@ def test_matching_microphone_is_not_reported(app, monkeypatch) -> None:
         def capture_mismatch(self):
             return None
 
+        server_side_fallback = False
+
     app._warn_about_capture_device(_Matching())
 
     assert messages == []
+
+
+def test_server_side_microphone_is_reported(app, monkeypatch) -> None:
+    messages: list[tuple[object, str]] = []
+    monkeypatch.setattr(
+        app.notifier,
+        "notify",
+        lambda title, message, **kwargs: messages.append(
+            (kwargs.get("key"), message)
+        )
+        or True,
+    )
+
+    class _ServerSide:
+        server_side_fallback = True
+        device_name = "FrontMic (Realtek HD Audio)"
+
+        def capture_mismatch(self):
+            return None
+
+    app._warn_about_capture_device(_ServerSide())
+
+    assert messages
+    assert messages[0][0] == "mic-server"
+    assert "Перенаправленный микрофон RDP" in messages[0][1]
 
 
 def test_warm_up_does_not_change_the_recording_state(app, monkeypatch) -> None:

@@ -435,16 +435,29 @@ class VoiceTyperApp:
     def _warn_about_capture_device(self, session: RecordingSession) -> None:
         """Tell the user when the configured microphone was silently replaced."""
         opened = session.capture_mismatch()
-        if not opened:
+        if opened:
+            logger.warning("Настроенный микрофон недоступен — запись идёт с «%s»", opened)
+            self.notifier.notify(
+                "Микрофон",
+                f"Настроенный микрофон не открылся — запись идёт с «{opened}». "
+                "Проверьте выбор микрофона в настройках.",
+                key="mic-fallback",
+                cooldown=300.0,
+            )
             return
-        logger.warning("Настроенный микрофон недоступен — запись идёт с «%s»", opened)
-        self.notifier.notify(
-            "Микрофон",
-            f"Настроенный микрофон не открылся — запись идёт с «{opened}». "
-            "Проверьте выбор микрофона в настройках.",
-            key="mic-fallback",
-            cooldown=300.0,
-        )
+        if session.server_side_fallback:
+            logger.warning(
+                "Запись идёт с микрофона, подключённого к серверу: %s",
+                session.device_name or "default",
+            )
+            self.notifier.notify(
+                "Микрофон",
+                "Перенаправленный микрофон RDP не открылся — запись идёт с устройства, "
+                "подключённого к этому компьютеру. Если гарнитура вставлена в другой "
+                "компьютер, запись получится тихой.",
+                key="mic-server",
+                cooldown=300.0,
+            )
 
     def stop_recording(self) -> None:
         with self._recording_lock:
