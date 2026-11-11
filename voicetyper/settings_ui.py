@@ -605,6 +605,19 @@ class SettingsWindow:
             text="Не запускать второй экземпляр (требуется перезапуск)",
             variable=self.vars["single_instance"],
         ).pack(anchor="w", pady=2)
+        self.vars["warmup_microphone"] = tk.BooleanVar()
+        ttk.Checkbutton(
+            notifications,
+            text="Прогревать микрофон при запуске (первая запись начнётся быстрее)",
+            variable=self.vars["warmup_microphone"],
+        ).pack(anchor="w", pady=2)
+        ttk.Label(
+            notifications,
+            text="Прогрев один раз открывает и сразу закрывает микрофон при старте: "
+            "индикатор записи не включается и файлы не создаются.",
+            style="Hint.TLabel",
+            wraplength=650,
+        ).pack(anchor="w", pady=(0, 2))
 
         self._register_dirty_traces()
         return 2
@@ -870,6 +883,7 @@ class SettingsWindow:
             self.vars["streaming_preview"].set(cfg.streaming_preview)
             self.vars["autostart"].set(cfg.autostart)
             self.vars["single_instance"].set(cfg.single_instance)
+            self.vars["warmup_microphone"].set(cfg.warmup_microphone)
             self.exclude_text.delete("1.0", "end")
             self.exclude_text.insert("1.0", "\n".join(cfg.exclude_phrases))
             self.exclude_text.edit_modified(False)
@@ -1219,6 +1233,7 @@ class SettingsWindow:
                 streaming_preview=bool(self.vars["streaming_preview"].get()),
                 autostart=bool(self.vars["autostart"].get()),
                 single_instance=bool(self.vars["single_instance"].get()),
+                warmup_microphone=bool(self.vars["warmup_microphone"].get()),
             )
         except (ValueError, HotkeyError) as exc:
             messagebox.showerror("Проверьте настройки", str(exc), parent=self.root)

@@ -99,6 +99,12 @@ def test_language_is_russian_only_without_whisper() -> None:
     assert not warnings
 
 
+def test_warmup_microphone_defaults_to_true() -> None:
+    assert Config().warmup_microphone is True
+    assert validate_mapping({"warmup_microphone": "off"})[0].warmup_microphone is False
+    assert validate_mapping({})[0].warmup_microphone is True
+
+
 def test_persisted_json_has_schema_version(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     store = ConfigStore(path)

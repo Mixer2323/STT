@@ -97,3 +97,31 @@ def test_matching_microphone_is_not_reported(app, monkeypatch) -> None:
     app._warn_about_capture_device(_Matching())
 
     assert messages == []
+
+
+def test_warm_up_does_not_change_the_recording_state(app, monkeypatch) -> None:
+    from voicetyper import app as app_module
+
+    states = _captured_states(app, monkeypatch)
+    warmed: list[object] = []
+    monkeypatch.setattr(
+        app_module, "warm_up_microphone", lambda cfg: warmed.append(cfg) or True
+    )
+
+    app._warm_up_microphone()
+
+    assert warmed
+    # The tray must stay idle: the warm-up is not a recording.
+    assert states == []
+
+
+def test_warm_up_is_skipped_while_recording(app, monkeypatch) -> None:
+    from voicetyper import app as app_module
+
+    warmed: list[object] = []
+    monkeypatch.setattr(app_module, "warm_up_microphone", lambda cfg: warmed.append(cfg))
+    app._recording = _Session(RecordingResult())
+
+    app._warm_up_microphone()
+
+    assert warmed == []

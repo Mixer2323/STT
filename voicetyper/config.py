@@ -68,6 +68,7 @@ class Config:
     streaming_preview: bool = True
     autostart: bool = False
     single_instance: bool = True
+    warmup_microphone: bool = True
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -264,6 +265,7 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
         "streaming_preview",
         "autostart",
         "single_instance",
+        "warmup_microphone",
     ):
         if name in raw:
             setattr(cfg, name, _as_bool(raw[name], getattr(cfg, name)))

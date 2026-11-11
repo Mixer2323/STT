@@ -550,9 +550,10 @@ def configured_device_name(value: int | str | None) -> str:
 # The last capture configuration that actually opened. Trying it first skips
 # the rejected candidates, which is what makes every press after the first one
 # start recording noticeably sooner (Bluetooth endpoints are especially slow).
-# The entry expires so a microphone that comes back (a USB headset plugged in,
-# an RDP session reconnected) is probed again after a pause in dictation.
-_CAPTURE_CACHE_SECONDS = 60.0
+# An entry that points at the configured device is used indefinitely; a fallback
+# entry (the configured microphone was unavailable) expires so the configured
+# device gets another chance after a pause in dictation.
+_CAPTURE_CACHE_SECONDS = 300.0
 _last_capture: Optional[
     tuple[float, int | str | None, Optional[int], int, int, bool]
 ] = None
@@ -578,16 +579,22 @@ def _remember_capture(
         )
 
 
-def _recall_capture() -> Optional[tuple[int | str | None, Optional[int], int, int, bool]]:
+def _recall_capture(
+    configured: int | str | None,
+    resolved: Optional[int],
+) -> Optional[tuple[Optional[int], int, int, bool]]:
     global _last_capture
     with _last_capture_lock:
         cached = _last_capture
         if cached is None:
             return None
-        if time.monotonic() - cached[0] > _CAPTURE_CACHE_SECONDS:
+        stamp, cached_configured, device, rate, channels, exclusive = cached
+        if cached_configured != configured:
+            return None
+        if device != resolved and time.monotonic() - stamp > _CAPTURE_CACHE_SECONDS:
             _last_capture = None
             return None
-        return cached[1:]
+        return device, rate, channels, exclusive
 
 
 def _forget_capture() -> None:
@@ -928,10 +935,12 @@ class RecordingSession:
         assert sd is not None
         device_index = resolve_input_device(self.cfg.input_device)
         last_error: Optional[BaseException] = None
+        candidates = self._candidate_devices(device_index)
+        primary = candidates[0] if candidates else None
 
-        cached = _recall_capture()
-        if cached is not None and cached[0] == self.cfg.input_device:
-            _, cached_device, cached_rate, cached_channels, cached_exclusive = cached
+        cached = _recall_capture(self.cfg.input_device, primary)
+        if cached is not None:
+            cached_device, cached_rate, cached_channels, cached_exclusive = cached
             try:
                 stream = self._open_stream(
                     cached_device,
@@ -974,8 +983,8 @@ class RecordingSession:
                     break
                 # Device indices can shift after the PortAudio restart.
                 device_index = resolve_input_device(self.cfg.input_device)
+                candidates = self._candidate_devices(device_index)
 
-            candidates = self._candidate_devices(device_index)
             logger.debug(
                 "Кандидаты микрофона: %s",
                 ", ".join("default" if c is None else str(c) for c in candidates),
@@ -1393,6 +1402,73 @@ class RecordingSession:
             except OSError:
                 pass
             result.path = None
+
+    def discard(self) -> None:
+        """Stop capturing and throw the audio away.
+
+        Used by the startup warm-up: it must not produce a recording, a log
+        line about a saved file, or any tray/recording state change.
+        """
+        with self._finalize_lock:
+            with self._lock:
+                self._stopped = True
+                self._started = False
+                stream = self._stream
+                self._stream = None
+                native_thread = self._native_thread
+                native_stop = self._native_stop
+                self._native_thread = None
+                self._native_stop = None
+                self._chunks = []
+                self._frames = 0
+            if native_stop is not None:
+                native_stop.set()
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    logger.debug("Ошибка остановки потока прогрева", exc_info=True)
+                try:
+                    stream.close()
+                except Exception:
+                    logger.debug("Ошибка закрытия потока прогрева", exc_info=True)
+            if native_thread is not None:
+                native_thread.join(timeout=2.0)
+            with self._lock:
+                self._result = RecordingResult(error="Запись отменена")
+
+
+def warm_up_microphone(cfg: Config, *, settle: float = 0.2) -> bool:
+    """Open the capture device once and close it without recording anything.
+
+    Initialises the audio stack and fills the capture configuration cache, so
+    the first real dictation opens the microphone immediately instead of
+    probing every candidate. No file is written and the recording state of the
+    application is not touched (the tray icon must stay idle).
+    """
+    if not HAS_SOUNDDEVICE:
+        return False
+    session = RecordingSession(cfg)
+    try:
+        session.start()
+    except AudioError as exc:
+        logger.info("Прогрев микрофона: устройство недоступно (%s)", exc)
+        return False
+    except Exception:
+        logger.debug("Прогрев микрофона не удался", exc_info=True)
+        return False
+    try:
+        if settle > 0:
+            time.sleep(settle)
+    finally:
+        session.discard()
+    logger.info(
+        "Микрофон прогрет: устройство=%s, %d Гц, каналов=%d",
+        session._device_index if session._device_index is not None else "default",
+        session._capture_rate,
+        session._capture_channels,
+    )
+    return True
 
 
 def _grouped_error_lines(errors: list[tuple[int, int, str]]) -> list[str]:

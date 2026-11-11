@@ -723,16 +723,16 @@ def test_remembered_configuration_is_ignored_for_another_microphone(
     assert fake.opened[0][0] != 9
 
 
-def test_expired_capture_configuration_is_probed_again(
+def test_expired_fallback_capture_configuration_is_probed_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
     monkeypatch.setattr(audio, "sd", fake)
     monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
 
-    # A remembered mono configuration that has aged out must not be used: the
-    # normal search opens the first candidate (stereo) instead.
-    audio._remember_capture(None, 9, 44100, 1, False)
+    # A remembered *fallback* device (the system default would have been 9)
+    # that has aged out is not used: the configured device is tried again.
+    audio._remember_capture(None, 1, 44100, 1, False)
     stale = audio._last_capture
     audio._last_capture = (stale[0] - audio._CAPTURE_CACHE_SECONDS - 1, *stale[1:])
 
@@ -740,6 +740,44 @@ def test_expired_capture_configuration_is_probed_again(
     session.start()
     try:
         assert fake.opened[0] == (9, 44100, 2)
+    finally:
+        session.stop()
+
+
+def test_fallback_capture_configuration_is_used_while_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    audio._remember_capture(None, 1, 44100, 1, False)
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    try:
+        assert fake.opened[0] == (1, 44100, 1)
+    finally:
+        session.stop()
+
+
+def test_configured_capture_configuration_never_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+
+    # The remembered device *is* the configured one, so it stays valid however
+    # long the user was silent.
+    audio._remember_capture(None, 9, 44100, 1, False)
+    stale = audio._last_capture
+    audio._last_capture = (stale[0] - audio._CAPTURE_CACHE_SECONDS - 1, *stale[1:])
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    try:
+        assert fake.opened[0] == (9, 44100, 1)
     finally:
         session.stop()
 
@@ -774,6 +812,40 @@ def test_capture_mismatch_accepts_the_configured_device(
         assert session.capture_mismatch() is None
     finally:
         session.stop()
+
+
+def test_warm_up_fills_the_cache_without_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(
+        audio, "save_wav", lambda *_args, **_kwargs: pytest.fail("warm-up wrote a file")
+    )
+
+    assert audio.warm_up_microphone(Config(), settle=0)
+    assert fake.opened == [(9, 44100, 2)]
+    assert audio._recall_capture(None, 9) == (9, 44100, 2, False)
+
+    fake.opened.clear()
+    session = audio.RecordingSession(Config())
+    session.start()
+    session.stop()
+    assert fake.opened[0] == (9, 44100, 2)
+
+
+def test_warm_up_reports_an_unavailable_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSoundDevice(_field_machine(), 1, wasapi_default=9)
+    fake.failing_devices = {9, 1, 5}
+    monkeypatch.setattr(audio, "sd", fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDDEVICE", True)
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", False)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", False)
+
+    assert audio.warm_up_microphone(Config(), settle=0) is False
 
 
 def test_capture_mismatch_accepts_the_wasapi_twin(monkeypatch: pytest.MonkeyPatch) -> None:

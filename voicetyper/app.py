@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Optional
 
 from . import paths, single_instance
-from .audio import AudioError, RecordingSession, probe_input_devices, refresh_input_devices
+from .audio import (
+    AudioError,
+    RecordingSession,
+    probe_input_devices,
+    refresh_input_devices,
+    warm_up_microphone,
+)
 from .autostart import is_enabled as autostart_is_enabled
 from .autostart import is_supported as autostart_supported
 from .autostart import set_enabled as set_autostart_enabled
@@ -306,6 +312,25 @@ class VoiceTyperApp:
 
         if self._open_settings_on_start or self._first_run:
             self.settings.open("main")
+
+        if cfg.warmup_microphone:
+            threading.Thread(
+                target=self._warm_up_microphone, name="mic-warmup", daemon=True
+            ).start()
+
+    def _warm_up_microphone(self) -> None:
+        """Prepare the capture device so the first dictation starts faster.
+
+        Runs in the background and never changes the recording state: while the
+        microphone is only being warmed up the tray icon must stay idle, no
+        notification is shown and no audio file is produced.
+        """
+        if self._shutdown_event.is_set():
+            return
+        with self._recording_lock:
+            if self._recording is not None or self._shutdown_event.is_set():
+                return
+            warm_up_microphone(self.config_store.get())
 
     def _cleanup(self) -> None:
         with self._cleanup_lock:
