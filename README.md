@@ -197,7 +197,6 @@ T-one и Faster-Whisper скачиваются с Hugging Face.
 | `device` | `auto`, `cpu`, `cuda` | `auto` |
 | `compute_type` | `auto`, `int8`, `float16`, `int8_float16` | `auto` |
 | `input_device` | индекс или имя микрофона | системный |
-| `server_microphone` | `true`/`false` | `false` |
 | `max_recording_seconds` | 10–3600 | `300` |
 | `insert_mode` | `paste`, `clipboard`, `type`, `type_scancode` | `paste` |
 | `restore_clipboard` | `true`/`false` | `true` |

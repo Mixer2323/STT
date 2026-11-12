@@ -385,25 +385,16 @@ class SettingsWindow:
         )
         self.vars["max_recording_seconds"] = tk.StringVar()
         self._spin_row(hotkey_box, 4, "Максимум записи, с", self.vars["max_recording_seconds"], 10, 3600)
-        self.vars["server_microphone"] = tk.BooleanVar()
-        ttk.Checkbutton(
-            hotkey_box,
-            text="Гарнитура подключена физически к этому компьютеру",
-            variable=self.vars["server_microphone"],
-            command=self._on_server_mic_toggled,
-        ).grid(row=5, column=1, sticky="w", pady=2)
         ttk.Label(
             hotkey_box,
             text=(
-                "В сеансе RDP Windows показывает только «Удаленное аудио» — микрофон "
-                "вашего домашнего компьютера. Физические входы самого сервера приложение "
-                "не использует, иначе оно молчит, пока вы говорите в гарнитуру в другом "
-                "месте. Отметьте этот пункт, только если гарнитура воткнута в тот "
-                "компьютер, где запущен Voice Typer."
+                "«Системный по умолчанию» — устройство записи, выбранное сейчас в "
+                "Windows. Если Windows переключит микрофон, приложение сделает то же "
+                "само. Можно закрепить конкретный микрофон."
             ),
             style="Hint.TLabel",
             wraplength=int(480 * self._scale),
-        ).grid(row=6, column=1, sticky="w", pady=(0, 6))
+        ).grid(row=5, column=1, sticky="w", pady=(0, 6))
 
         engine_box = ttk.LabelFrame(frame, text="Распознавание", padding=10)
         engine_box.pack(fill="x")
@@ -849,8 +840,6 @@ class SettingsWindow:
         cfg = self._store.get()
         self._loading = True
         try:
-            # The device list depends on this flag, so set it before refreshing.
-            self.vars["server_microphone"].set(cfg.server_microphone)
             self._refresh_devices()
             self.vars["hotkey"].set(cfg.hotkey)
             self.vars["hotkey_mode"].set(_HOTKEY_MODE_LABELS.get(cfg.hotkey_mode, "Удержание"))
@@ -899,13 +888,8 @@ class SettingsWindow:
         # The app serialises this with recording so an open stream is never
         # torn down by PortAudio's _terminate/_initialize.
         self._app.refresh_audio_devices()
-        # Kernel (WDM-KS) inputs are not what Windows shows in the session, so
-        # they only belong in the list when the user says the headset really is
-        # plugged into this computer.
-        variable = self.vars.get("server_microphone")
-        include_kernel = bool(variable.get()) if variable is not None else False
-        self._devices = visible_input_devices(include_kernel=include_kernel)
-        self._device_labels = ["Системный по умолчанию"]
+        self._devices = visible_input_devices()
+        self._device_labels = ["Системный по умолчанию (как в Windows)"]
         self._device_values = [None]
         for device in self._devices:
             self._device_labels.append(f"{device.index}: {device.label()}")
@@ -923,11 +907,6 @@ class SettingsWindow:
             self.device_combo.configure(textvariable=self.vars["input_device"])
         if self.vars["input_device"].get() not in self._device_labels:
             self.device_combo.set(self._device_labels[0])
-
-    def _on_server_mic_toggled(self) -> None:
-        if self._loading:
-            return
-        self._refresh_devices()
 
     def _select_input_device(self, value) -> None:
         if value not in self._device_values and value is not None:
@@ -1216,7 +1195,6 @@ class SettingsWindow:
                     "max_recording_seconds", "Максимум записи", 10, 3600
                 ),
                 input_device=device_index,
-                server_microphone=bool(self.vars["server_microphone"].get()),
                 insert_mode=self.vars["insert_mode"].get(),
                 restore_clipboard=bool(self.vars["restore_clipboard"].get()),
                 restore_target_window=bool(self.vars["restore_target_window"].get()),

@@ -50,7 +50,6 @@ class Config:
     vad_filter: bool = True
     sample_rate: int = 16000
     input_device: int | str | None = None
-    server_microphone: bool = False
     max_recording_seconds: int = 300
     exclude_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_PHRASES))
     insert_mode: str = "paste"  # paste | clipboard | type | type_scancode
@@ -253,7 +252,6 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
 
     for name in (
         "vad_filter",
-        "server_microphone",
         "restore_clipboard",
         "restore_target_window",
         "trim_silence",

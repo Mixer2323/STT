@@ -138,12 +138,33 @@ def list_input_devices() -> list[InputDevice]:
     return devices
 
 
-def default_input_device() -> Optional[InputDevice]:
+def _windows_default_input() -> Optional[int]:
+    """Index of the Windows default capture endpoint.
+
+    The WASAPI host API is what Windows applications use, so its default input
+    is the device the user sees as the default in Windows settings. PortAudio's
+    own default (the MME "Sound Mapper") is only a fallback.
+    """
     if not HAS_SOUNDDEVICE:
         return None
     try:
-        index = sd.default.device[0]
+        for hostapi in sd.query_hostapis():
+            if "wasapi" in str(hostapi.get("name", "")).casefold():
+                index = int(hostapi.get("default_input_device", -1))
+                if index >= 0:
+                    return index
     except Exception:
+        logger.debug(
+            "Не удалось определить устройство Windows по умолчанию", exc_info=True
+        )
+    return _system_default_input()
+
+
+def default_input_device() -> Optional[InputDevice]:
+    if not HAS_SOUNDDEVICE:
+        return None
+    index = _windows_default_input()
+    if index is None:
         return None
     for device in list_input_devices():
         if device.index == index:
@@ -167,10 +188,6 @@ def is_remote_session() -> bool:
         return False
 
 
-_DEVICE_REFRESH_SECONDS = 60.0
-_last_device_refresh = 0.0
-
-
 def refresh_input_devices() -> bool:
     """Re-enumerate PortAudio devices.
 
@@ -178,7 +195,6 @@ def refresh_input_devices() -> bool:
     set of audio devices changes when the client connects or disconnects, so
     the cached list (and the default device index) can become stale.
     """
-    global _last_device_refresh
     if not HAS_SOUNDDEVICE:
         return False
     terminate = getattr(sd, "_terminate", None)
@@ -191,7 +207,6 @@ def refresh_input_devices() -> bool:
     except Exception:
         logger.warning("Не удалось обновить список аудиоустройств", exc_info=True)
         return False
-    _last_device_refresh = time.monotonic()
     logger.debug("Список аудиоустройств обновлён")
     return True
 
@@ -210,27 +225,6 @@ def _system_default_input() -> Optional[int]:
     return index if index >= 0 else None
 
 
-def _wasapi_default_input() -> Optional[int]:
-    """PortAudio index of the default WASAPI input device, if available.
-
-    Windows apps normally capture through WASAPI (shared mode). PortAudio's
-    default input, however, is usually the MME "Sound Mapper", and MME cannot
-    open the RDP "Remote Audio" endpoint at all (MMSYSERR_INVALPARAM / error
-    11), even though other applications record from it without problems.
-    """
-    if not HAS_SOUNDDEVICE:
-        return None
-    try:
-        for hostapi in sd.query_hostapis():
-            if "wasapi" not in str(hostapi.get("name", "")).casefold():
-                continue
-            index = int(hostapi.get("default_input_device", -1))
-            return index if index >= 0 else None
-    except Exception:
-        logger.debug("Не удалось определить устройство WASAPI", exc_info=True)
-    return None
-
-
 def _same_device_name(first: str, second: str) -> bool:
     """Compare device names across host APIs, tolerating MME truncation."""
     a = first.strip().casefold()
@@ -241,26 +235,6 @@ def _same_device_name(first: str, second: str) -> bool:
         return True
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     return len(short) >= 12 and long.startswith(short)
-
-
-def _wasapi_equivalent(device_index: Optional[int]) -> Optional[int]:
-    """Find the WASAPI entry for the same physical device."""
-    if not HAS_SOUNDDEVICE or device_index is None:
-        return None
-    try:
-        name = _clean_device_name(sd.query_devices(device_index, "input").get("name", ""))
-    except Exception:
-        return None
-    if not name:
-        return None
-    for device in list_input_devices():
-        if device.index == device_index:
-            continue
-        if "wasapi" not in device.hostapi.casefold():
-            continue
-        if _same_device_name(device.name, name):
-            return device.index
-    return None
 
 
 def _hostapi_name(device_index: Optional[int]) -> str:
@@ -355,26 +329,6 @@ def _usable_input_devices() -> list[InputDevice]:
     ]
 
 
-def _mirror_hostapi_devices() -> list[int]:
-    """Non-WASAPI, non-kernel indices: the session endpoints seen from MME/DirectSound."""
-    return [
-        device.index
-        for device in _usable_input_devices()
-        if "wasapi" not in device.hostapi.casefold() and not _is_kernel_device(device)
-    ]
-
-
-def _kernel_devices() -> list[int]:
-    """WDM-KS indices — the hardware Windows does not show in the session."""
-    return [
-        device.index
-        for device in sorted(
-            (device for device in _usable_input_devices() if _is_kernel_device(device)),
-            key=lambda device: 0 if _looks_like_microphone(device.name) else 1,
-        )
-    ]
-
-
 def visible_input_devices(*, include_kernel: bool = False) -> list[InputDevice]:
     """One entry per recording device, the way Windows itself lists them.
 
@@ -419,43 +373,41 @@ def _wasapi_exclusive_settings() -> object:
         return None
 
 
-def _format_candidates(device_index: Optional[int], requested: int) -> list[tuple[int, int]]:
-    """Return (samplerate, channels) pairs to try, most likely first.
+def _device_formats(
+    device_index: Optional[int], requested_rate: int
+) -> list[tuple[int, int]]:
+    """(samplerate, channels) pairs to try for one device, most likely first.
 
-    MME (the Windows host API PortAudio picks by default) can report a format
-    as supported through ``check_input_settings`` yet still fail ``waveInOpen``
-    with ``MMSYSERR_INVALPARAM`` (PortAudio's "MME error 11") for sample rates
-    the driver does not really accept — typical for the RDP audio redirection
-    device and Bluetooth hands-free mics. So we prefer the device's own
-    default rate and also try mono/stereo.
-
-    WASAPI devices are tried with stereo first: some virtual endpoints (the RDP
-    "Remote Audio" device in particular) report a single channel but only open
-    in shared mode when stereo is requested.
+    Only one device is opened now, so the list stays short: its own default
+    rate first, then the usual rates. WASAPI endpoints are tried with stereo
+    first (some virtual endpoints refuse mono), MME/DirectSound with mono first.
     """
     if not HAS_SOUNDDEVICE:
         return []
     default_rate = 0
+    max_channels = 1
     try:
         info = sd.query_devices(device_index, "input")
         default_rate = int(round(float(info.get("default_samplerate", 0) or 0)))
+        max_channels = max(1, int(info.get("max_input_channels", 1) or 1))
     except Exception:
         pass
-
-    rates = [
-        rate
-        for rate in (default_rate, 48000, 44100, requested, 16000, 8000)
-        if rate > 0
-    ]
-    if _is_wasapi_index(device_index):
+    rate = default_rate or int(requested_rate) or 16000
+    if max_channels < 2:
+        channel_options = [1]
+    elif _is_wasapi_index(device_index):
         channel_options = [2, 1]
     else:
         channel_options = [1, 2]
-
+    rates = [rate] + [
+        value
+        for value in (requested_rate, 48000, 44100, 16000)
+        if value and value != rate
+    ]
     formats: list[tuple[int, int]] = []
-    for rate in dict.fromkeys(rates):
+    for sample_rate in dict.fromkeys(rates):
         for channels in channel_options:
-            formats.append((rate, channels))
+            formats.append((sample_rate, channels))
     return formats
 
 
@@ -533,6 +485,38 @@ def resolve_input_device(value: int | str | None) -> Optional[int]:
     return _system_default_input()
 
 
+def target_device_index(value: int | str | None = None) -> Optional[int]:
+    """Index of the microphone the app will open, or None when there is none.
+
+    A device chosen in the settings wins when it still exists; otherwise the
+    Windows default input is used. No other device is ever picked automatically.
+    """
+    if not HAS_SOUNDDEVICE:
+        return None
+    devices = list_input_devices()
+    if value not in (None, ""):
+        if isinstance(value, bool):
+            return _windows_default_input()
+        if isinstance(value, int):
+            if any(device.index == value for device in devices):
+                return value
+        else:
+            text = str(value).strip()
+            if text.isdigit():
+                index = int(text)
+                if any(device.index == index for device in devices):
+                    return index
+            else:
+                needle = text.casefold()
+                exact = [d for d in devices if d.name.casefold() == needle]
+                if exact:
+                    return exact[0].index
+                partial = [d for d in devices if needle and needle in d.name.casefold()]
+                if len(partial) == 1:
+                    return partial[0].index
+    return _windows_default_input()
+
+
 def configured_device_name(value: int | str | None) -> str:
     """Name of the microphone the settings point at, or "" when it is gone."""
     if value in (None, "") or isinstance(value, bool):
@@ -553,65 +537,8 @@ def configured_device_name(value: int | str | None) -> str:
     return partial[0].name if len(partial) == 1 else ""
 
 
-# The last capture configuration that actually opened. Trying it first skips
-# the rejected candidates, which is what makes every press after the first one
-# start recording noticeably sooner (Bluetooth endpoints are especially slow).
-# An entry that points at the configured device is used indefinitely; a fallback
-# entry (the configured microphone was unavailable) expires so the configured
-# device gets another chance after a pause in dictation.
-_CAPTURE_CACHE_SECONDS = 300.0
-_last_capture: Optional[
-    tuple[float, int | str | None, Optional[int], int, int, bool]
-] = None
-_last_capture_lock = threading.Lock()
-
-
-def _remember_capture(
-    configured: int | str | None,
-    device: Optional[int],
-    rate: int,
-    channels: int,
-    exclusive: bool,
-) -> None:
-    global _last_capture
-    with _last_capture_lock:
-        _last_capture = (
-            time.monotonic(),
-            configured,
-            device,
-            rate,
-            channels,
-            exclusive,
-        )
-
-
-def _recall_capture(
-    configured: int | str | None,
-    resolved: Optional[int],
-) -> Optional[tuple[Optional[int], int, int, bool]]:
-    global _last_capture
-    with _last_capture_lock:
-        cached = _last_capture
-        if cached is None:
-            return None
-        stamp, cached_configured, device, rate, channels, exclusive = cached
-        if cached_configured != configured:
-            return None
-        if device != resolved and time.monotonic() - stamp > _CAPTURE_CACHE_SECONDS:
-            _last_capture = None
-            return None
-        return device, rate, channels, exclusive
-
-
-def _forget_capture() -> None:
-    global _last_capture
-    with _last_capture_lock:
-        _last_capture = None
-
-
 def _reset_capture_cache() -> None:
-    """Forget remembered capture state (used by tests and diagnostics)."""
-    _forget_capture()
+    """Forget the remembered Media Foundation failure (tests and diagnostics)."""
     _forget_media_foundation_failure()
 
 
@@ -654,20 +581,6 @@ def _capture_blockers() -> list[str]:
     except Exception:
         logger.debug("Не удалось проверить ограничения записи Windows", exc_info=True)
         return []
-
-
-def _open_microphone_message(error: Optional[BaseException]) -> str:
-    detail = str(error) if error else "устройство недоступно"
-    message = f"Не удалось открыть микрофон: {detail}"
-    blockers = _capture_blockers()
-    if blockers:
-        message += " " + blockers[0]
-    elif is_remote_session():
-        message += (
-            " Проверьте перенаправление микрофона в RDP: «Локальные ресурсы» → "
-            "«Звук» → «Параметры» → «Запись с этого компьютера»."
-        )
-    return message
 
 
 def _resample_float(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -875,9 +788,9 @@ class RecordingSession:
         with self._lock:
             return self._result
 
-    def _candidate_formats(self, device_index: Optional[int]) -> list[tuple[int, int]]:
-        """Return (samplerate, channels) pairs to try, most likely first."""
-        return _format_candidates(device_index, int(self.cfg.sample_rate))
+    def _device_formats(self, device_index: Optional[int]) -> list[tuple[int, int]]:
+        """Return (samplerate, channels) pairs to try for the chosen device."""
+        return _device_formats(device_index, int(self.cfg.sample_rate))
 
     def _open_stream(
         self,
@@ -910,212 +823,94 @@ class RecordingSession:
             raise
         return stream
 
-    def _candidate_devices(self, device_index: Optional[int]) -> list[Optional[int]]:
-        """Device indices to try, best first.
+    def _resolve_target(self) -> Optional[int]:
+        """The microphone to open: the selected one, or the Windows default."""
+        return target_device_index(self.cfg.input_device)
 
-        On Windows the WASAPI endpoint is preferred: it is what other
-        applications use, and MME/DirectSound cannot open the RDP "Remote
-        Audio" device. An explicitly selected device is tried first, with its
-        WASAPI equivalent as a fallback. All WASAPI input devices are tried
-        before that, because the default endpoint reported by PortAudio is not
-        always the one that actually carries audio. Then come the MME and
-        DirectSound views of the same session endpoints. Kernel (WDM-KS) inputs
-        are last and off by default: in a remote session they are the
-        microphones physically attached to the server, which record silence
-        from a headset hundreds of kilometres away, so they are only tried when
-        the user says the microphone really is plugged into this computer.
+    def _targets(self) -> list[int]:
+        """Devices to try, in order: the selected one, then the Windows default.
+
+        Two entries at most: a microphone chosen in the settings, and the device
+        Windows currently uses. Nothing else is ever tried automatically.
         """
-        # Mixers, loopback and the MME "Sound Mapper" pseudo-devices are not
-        # microphones: they are hidden in the device list, so opening them
-        # automatically would record system audio or silence instead of speech.
-        wasapi_devices = [
-            device.index
-            for device in _usable_input_devices()
-            if "wasapi" in device.hostapi.casefold()
-        ]
-        wasapi_default = _wasapi_default_input()
-        explicit = self.cfg.input_device not in (None, "")
-        ordered: list[Optional[int]] = []
+        selected = self._resolve_target()
+        targets: list[int] = []
+        if selected is not None:
+            targets.append(selected)
+        if self.cfg.input_device not in (None, ""):
+            default = _windows_default_input()
+            if default is not None and default not in targets:
+                targets.append(default)
+        if not targets:
+            raise AudioError(_no_input_device_message())
+        return targets
 
-        def add(index: Optional[int]) -> None:
-            if index is not None and index not in ordered:
-                ordered.append(index)
+    def _open_target(
+        self, device_index: Optional[int]
+    ) -> tuple[object, int, int, Optional[int]]:
+        """Open one microphone with the shortest possible format fallback.
 
-        if explicit:
-            add(device_index)
-            add(_wasapi_equivalent(device_index))
-            add(wasapi_default)
-            for index in wasapi_devices:
-                add(index)
-        else:
-            add(wasapi_default)
-            for index in wasapi_devices:
-                add(index)
-            add(device_index)
-            add(_system_default_input())
-        for index in _mirror_hostapi_devices():
-            add(index)
-        if self.cfg.server_microphone:
-            for index in _kernel_devices():
-                add(index)
-        if not ordered:
-            ordered.append(None)
-        return ordered
-
-    def _refresh_stale_devices(self) -> None:
-        """Re-enumerate PortAudio when the cached device list may be out of date.
-
-        An RDP redirect endpoint appears (or disappears) when the client
-        connects, and the application may have been started before that, so the
-        first recording of a session re-reads the list instead of trusting the
-        one PortAudio cached at startup.
+        There is no automatic switching to another device: the settings decide
+        (a specific microphone or the Windows default), and a failure is
+        reported to the user instead of silently recording from somewhere else.
         """
-        if time.monotonic() - _last_device_refresh < _DEVICE_REFRESH_SECONDS:
-            return
-        refresh_input_devices()
-
-    def _open_first_available(self) -> tuple[object, int, int, Optional[int]]:
         assert sd is not None
-        device_index = resolve_input_device(self.cfg.input_device)
+        if device_index is None:
+            raise AudioError(_no_input_device_message())
         last_error: Optional[BaseException] = None
-        candidates = self._candidate_devices(device_index)
-        primary = candidates[0] if candidates else None
-
-        cached = _recall_capture(self.cfg.input_device, primary)
-        if cached is not None:
-            cached_device, cached_rate, cached_channels, cached_exclusive = cached
+        for rate, channels in self._device_formats(device_index):
             try:
-                stream = self._open_stream(
-                    cached_device,
-                    cached_rate,
-                    cached_channels,
-                    exclusive=cached_exclusive,
-                )
+                stream = self._open_stream(device_index, rate, channels)
             except Exception as exc:
+                last_error = exc
                 logger.debug(
-                    "Сохранённые настройки микрофона не подошли (%s, %d Гц, %d кан.): %s",
-                    cached_device if cached_device is not None else "default",
-                    cached_rate,
-                    cached_channels,
+                    "Не удалось открыть микрофон (%s, %d Гц, %d кан.): %s",
+                    device_index,
+                    rate,
+                    channels,
                     exc,
                 )
-                _forget_capture()
-            else:
-                logger.info(
-                    "Микрофон открыт (сохранённые настройки): устройство=%s (%s), "
-                    "%d Гц, каналов=%d, %s",
-                    cached_device if cached_device is not None else "default",
-                    _hostapi_name(cached_device) or "default host API",
-                    cached_rate,
-                    cached_channels,
-                    "exclusive" if cached_exclusive else "shared",
-                )
-                # Keep the entry fresh while dictation is active.
-                _remember_capture(
-                    self.cfg.input_device,
-                    cached_device,
-                    cached_rate,
-                    cached_channels,
-                    cached_exclusive,
-                )
-                return stream, cached_rate, cached_channels, cached_device
-
-        for attempt in range(2):
-            if attempt:
-                if not refresh_input_devices():
-                    break
-                # Device indices can shift after the PortAudio restart.
-                device_index = resolve_input_device(self.cfg.input_device)
-                candidates = self._candidate_devices(device_index)
-
-            logger.debug(
-                "Кандидаты микрофона: %s",
-                ", ".join("default" if c is None else str(c) for c in candidates),
+                continue
+            logger.info(
+                "Микрофон открыт: устройство=%s (%s), %d Гц, каналов=%d",
+                device_index,
+                _hostapi_name(device_index) or "default host API",
+                rate,
+                channels,
             )
-            for candidate in candidates:
-                # WASAPI shared mode is the normal path; exclusive mode is the
-                # last resort for endpoints that refuse shared-mode formats.
-                exclusive_modes = [False]
-                if candidate is not None and _is_wasapi_index(candidate):
-                    exclusive_modes.append(True)
-                candidate_error: Optional[BaseException] = None
-                for exclusive in exclusive_modes:
-                    for rate, channels in self._candidate_formats(candidate):
-                        try:
-                            stream = self._open_stream(
-                                candidate, rate, channels, exclusive=exclusive
-                            )
-                        except Exception as exc:
-                            last_error = exc
-                            candidate_error = exc
-                            logger.debug(
-                                "Не удалось открыть микрофон (%s, %d Гц, %d кан., %s): %s",
-                                candidate if candidate is not None else "default",
-                                rate,
-                                channels,
-                                "exclusive" if exclusive else "shared",
-                                exc,
-                            )
-                            continue
-                        if attempt:
-                            logger.info(
-                                "Список аудиоустройств обновлён — микрофон открыт заново"
-                            )
-                        logger.info(
-                            "Микрофон открыт: устройство=%s (%s), %d Гц, каналов=%d, %s",
-                            candidate if candidate is not None else "default",
-                            _hostapi_name(candidate) or "default host API",
-                            rate,
-                            channels,
-                            "exclusive" if exclusive else "shared",
-                        )
-                        _remember_capture(
-                            self.cfg.input_device, candidate, rate, channels, exclusive
-                        )
-                        if _is_server_side_fallback(candidate):
-                            logger.warning(
-                                "Перенаправленный микрофон RDP не открылся — запись идёт "
-                                "с устройства, подключённого к серверу: %s",
-                                _device_name(candidate),
-                            )
-                        return stream, rate, channels, candidate
+            if _is_server_side_fallback(device_index):
                 logger.warning(
-                    "Микрофон %s (%s) не открылся: %s",
-                    candidate if candidate is not None else "default",
-                    _hostapi_name(candidate) or "default host API",
-                    candidate_error,
+                    "Запись идёт с микрофона, подключённого к серверу: %s",
+                    _device_name(device_index),
                 )
-
-        if not list_input_devices():
-            raise AudioError(_no_input_device_message())
-        for device in list_input_devices():
-            logger.warning("Микрофон %s: %s", device.index, device.label())
-        for blocker in _capture_blockers():
+            return stream, rate, channels, device_index
+        name = _device_name(device_index) or "системный по умолчанию"
+        blockers = _capture_blockers()
+        for blocker in blockers:
             logger.warning("Ограничение записи Windows: %s", blocker)
-        logger.warning(
-            "Не удалось открыть ни один микрофон; последняя ошибка: %s", last_error
-        )
-        raise AudioError(_open_microphone_message(last_error))
+        logger.warning("Микрофон «%s» не открылся: %s", name, last_error)
+        message = f"Микрофон «{name}» не открылся: {last_error}"
+        if blockers:
+            message += ". " + blockers[0]
+        elif is_remote_session():
+            message += (
+                ". Проверьте перенаправление микрофона в RDP: «Локальные ресурсы» → "
+                "«Звук» → «Параметры» → «Запись с этого компьютера»."
+            )
+        else:
+            message += (
+                ". Возможно, устройство занято другим приложением — выберите другой "
+                "микрофон в настройках или смените устройство записи по умолчанию в Windows."
+            )
+        raise AudioError(message)
 
-    def _native_capture_names(self, device_index: Optional[int]) -> list[str]:
-        names: list[str] = []
-        for index in self._candidate_devices(device_index):
-            if index is None:
-                continue
-            try:
-                name = str(sd.query_devices(index, "input").get("name", ""))
-            except Exception:
-                continue
-            if name and name not in names:
-                names.append(name)
-        return names
 
-    def _start_native_capture(self) -> bool:
-        """Fall back to Windows Media Foundation capture.
+    def _start_native_capture(self, device_index: Optional[int]) -> bool:
+        """Fall back to Windows Media Foundation for the same endpoint.
 
-        PortAudio's WASAPI backend refuses to open some virtual endpoints,
-        notably the RDP "Remote Audio" device, even though Media Foundation —
-        the stack Windows applications use — records from it without problems.
+        Only used in a remote session: PortAudio cannot open the RDP "Remote
+        Audio" endpoint there, while Media Foundation can. The device is the one
+        the settings point at, never a different microphone.
         """
         if not HAS_SOUNDCARD or not HAS_MEDIA_FOUNDATION or os.name != "nt":
             return False
@@ -1124,8 +919,8 @@ class RecordingSession:
                 "Media Foundation недавно не смог открыть микрофон — попытка пропущена"
             )
             return False
-        device_index = resolve_input_device(self.cfg.input_device)
-        microphone = _find_soundcard_microphone(self._native_capture_names(device_index))
+        name = _device_name(device_index)
+        microphone = _find_soundcard_microphone([name] if name else [])
         if microphone is None:
             logger.warning("Windows Media Foundation не нашёл ни одного микрофона")
             _remember_media_foundation_failure()
@@ -1163,6 +958,7 @@ class RecordingSession:
             return False
         _forget_media_foundation_failure()
         return True
+
 
     def _native_capture_loop(
         self,
@@ -1270,24 +1066,39 @@ class RecordingSession:
         with self._lock:
             if self._started:
                 return
-            self._refresh_stale_devices()
-            try:
-                stream, rate, channels, device_index = self._open_first_available()
-            except AudioError:
-                if not self._start_native_capture():
-                    raise
+            # Re-read the device list so a device switched in Windows (a headset
+            # plugged in, an RDP client reconnecting) is followed immediately.
+            refresh_input_devices()
+            targets = self._targets()
+            opened = None
+            last_error: Optional[AudioError] = None
+            for target in targets:
+                try:
+                    opened = self._open_target(target)
+                except AudioError as exc:
+                    last_error = exc
+                    continue
+                break
+            if opened is None:
+                if not is_remote_session() or not self._start_native_capture(targets[-1]):
+                    if last_error is not None:
+                        raise last_error
+                    raise AudioError(_no_input_device_message())
                 self._started = True
                 self._stopped = False
-                self._device_index = None
-                self._device_name = self._native_mic_name
+                self._device_index = targets[-1]
+                self._device_name = (
+                    _device_name(targets[-1]) or self._native_mic_name
+                )
                 logger.info(
                     "Запись начата через Windows Media Foundation: устройство=%s, "
                     "%d Гц, каналов=%d",
-                    self._native_mic_name,
+                    self._device_name,
                     self._capture_rate,
                     self._capture_channels,
                 )
                 return
+            stream, rate, channels, device_index = opened
             self._stream = stream
             self._capture_rate = rate
             self._capture_channels = channels
@@ -1302,6 +1113,7 @@ class RecordingSession:
             self._capture_rate,
             self._capture_channels,
         )
+
 
     def capture_mismatch(self) -> Optional[str]:
         """Name of the opened microphone when it is not the configured one.
@@ -1567,7 +1379,6 @@ def _verdict_lines(
     redirect_seen: bool,
     mf_text: str,
     blockers: list[str],
-    server_microphone: bool,
 ) -> list[str]:
     """Say in plain words what the device table means, so the user knows what to fix."""
     lines = ["== Вывод =="]
@@ -1588,8 +1399,7 @@ def _verdict_lines(
             lines.append(
                 "  Микрофоны, подключённые к серверу, открываются: "
                 + "; ".join(local_opened[:3])
-                + " — говорить в них полезно только физически находясь у этого "
-                "компьютера, поэтому по умолчанию приложение их не использует."
+                + " — приложение их не подставляет автоматически."
             )
         return lines
     if failed_redirect and not opened:
@@ -1627,16 +1437,8 @@ def _verdict_lines(
             lines.append(
                 "  Микрофоны, подключённые к серверу, открываются ("
                 + "; ".join(local_opened[:3])
-                + "), но это устройства самого компьютера"
-                + (
-                    "; настройка «микрофон подключён к этому компьютеру» включена, "
-                    "и приложение попробует их — если гарнитура не вставлена в этот "
-                    "ПК, запись будет молчать."
-                    if server_microphone
-                    else " — приложение их не открывает. Включите настройку "
-                    "«микрофон подключён физически к этому компьютеру», только если "
-                    "гарнитура действительно в него вставлена."
-                )
+                + "), но это устройства самого компьютера — приложение использует "
+                "только выбранный микрофон или системный по умолчанию."
             )
         return lines
     if opened:
@@ -1651,10 +1453,9 @@ def _verdict_lines(
 def probe_input_devices(cfg: Optional[Config] = None) -> str:
     """Try to open every input device and describe the result.
 
-    Written for ``VoiceTyper.exe --audio-test``. The windowed PyInstaller build
-    has no console, so the report is written to a file and the user can send it
-    back. Each device is opened in shared mode and, for WASAPI devices, in
-    exclusive mode; the first working format is reported.
+    Written for ``VoiceTyper.exe --audio-test``: the windowed build has no
+    console, so the report is written to a file. This is the only place that
+    touches every device — recording itself opens one device only.
     """
     cfg = cfg or Config()
     lines = [
@@ -1663,8 +1464,6 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         f"Сеанс RDP: {'да' if is_remote_session() else 'нет'}",
         f"Частота из настроек: {int(cfg.sample_rate)} Гц",
         f"Микрофон из настроек: {cfg.input_device or 'системный по умолчанию'}",
-        "Гарнитура подключена к этому компьютеру: "
-        + ("да" if cfg.server_microphone else "нет"),
         "",
     ]
     if not HAS_SOUNDDEVICE:
@@ -1675,33 +1474,12 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
     devices = list_input_devices()
     default = default_input_device()
     lines.append(f"Микрофонов найдено: {len(devices)}")
-    lines.append(
-        "Сколько из них приложение считает устройствами сеанса "
-        "(столько же в списке настроек): "
-        f"{len(visible_input_devices(include_kernel=bool(cfg.server_microphone)))}"
-    )
     lines.append(f"Системный по умолчанию: {default.label() if default else 'не определён'}")
-    wasapi_default = _wasapi_default_input()
+    target = target_device_index(cfg.input_device)
     lines.append(
-        "WASAPI по умолчанию: "
-        + (str(wasapi_default) if wasapi_default is not None else "не определён")
+        "Будет использован: "
+        + (_device_name(target) if target is not None else "не определён")
     )
-    lines.append("")
-
-    session = RecordingSession(cfg)
-    try:
-        device_index = resolve_input_device(cfg.input_device)
-        candidates = session._candidate_devices(device_index)
-        lines.append("Порядок, в котором приложение пробует устройства:")
-        lines.append(
-            "  "
-            + " → ".join(
-                "default" if c is None else f"{c} ({_hostapi_name(c) or '?'})"
-                for c in candidates
-            )
-        )
-    except Exception as exc:
-        lines.append(f"Не удалось построить список кандидатов: {exc}")
     lines.append("")
 
     env = _capture_env() if os.name == "nt" else None
@@ -1710,66 +1488,47 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.extend(env.report_lines())
         lines.append("")
 
-    opened_labels: list[str] = []
+    session = RecordingSession(cfg)
+    opened: list[str] = []
     local_opened: list[str] = []
     failed_redirect: list[str] = []
     redirect_seen = False
     for device in devices:
         redirected = _is_redirected_endpoint(device.name)
         redirect_seen = redirect_seen or redirected
-        lines.append(
-            f"[{device.index}] {device.label()} | каналов: {device.channels}"
-            + (
-                " | устройство ядра, вне аудиодвижка сеанса"
-                if _is_kernel_device(device)
-                else ""
+        lines.append(f"[{device.index}] {device.label()} | каналов: {device.channels}")
+        errors: list[tuple[int, int, str]] = []
+        opened_format: Optional[tuple[int, int]] = None
+        for rate, channels in session._device_formats(device.index):
+            try:
+                stream = session._open_stream(device.index, rate, channels)
+            except Exception as exc:
+                errors.append((rate, channels, str(exc).strip()))
+                continue
+            opened_format = (rate, channels)
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                logger.debug("Ошибка закрытия тестового потока", exc_info=True)
+            break
+        if opened_format is not None:
+            lines.append(
+                f"    открыт: {opened_format[0]} Гц, {opened_format[1]} каналов"
             )
-        )
-        wasapi = "wasapi" in device.hostapi.casefold()
-        modes = (False, True) if wasapi else (False,)
-        device_ok = False
-        for exclusive in modes:
-            mode = "exclusive" if exclusive else "shared"
-            errors: list[tuple[int, int, str]] = []
-            opened: Optional[tuple[int, int]] = None
-            for rate, channels in session._candidate_formats(device.index):
-                try:
-                    stream = session._open_stream(
-                        device.index, rate, channels, exclusive=exclusive
-                    )
-                except Exception as exc:
-                    errors.append((rate, channels, str(exc).strip()))
-                    continue
-                opened = (rate, channels)
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    logger.debug("Ошибка закрытия тестового потока", exc_info=True)
-                break
-            if opened is not None:
-                lines.append(
-                    f"    {mode}: OK — {opened[0]} Гц, {opened[1]} каналов"
-                )
-                device_ok = True
-                opened_labels.append(f"[{device.index}] {device.name}")
-                if not redirected:
-                    local_opened.append(f"[{device.index}] {device.name}")
-                with session._lock:
-                    session._chunks.clear()
-                    session._frames = 0
-                break
+            opened.append(f"[{device.index}] {device.name}")
+            if not redirected:
+                local_opened.append(f"[{device.index}] {device.name}")
+        else:
             count = len(errors)
             label = "формат" if count == 1 else "форматов"
-            lines.append(f"    {mode}: не удалось — {count} {label}:")
+            lines.append(f"    не открылся — {count} {label}:")
             lines.extend(_grouped_error_lines(errors))
-            with session._lock:
-                session._chunks.clear()
-                session._frames = 0
-        if not device_ok:
-            lines.append("    ИТОГ: устройство не открывается")
             if redirected:
                 failed_redirect.append(f"[{device.index}] {device.name}")
+        with session._lock:
+            session._chunks.clear()
+            session._frames = 0
         lines.append("")
 
     mf_lines: list[str] = []
@@ -1788,17 +1547,16 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
     lines.extend(
         _verdict_lines(
             is_rdp=remote,
-            opened=opened_labels,
+            opened=opened,
             failed_redirect=failed_redirect,
             local_opened=local_opened,
             redirect_seen=redirect_seen,
             mf_text="\n".join(mf_lines),
             blockers=blockers,
-            server_microphone=bool(cfg.server_microphone),
         )
     )
     lines.append("")
-    if not opened_labels and not blockers and not (remote and failed_redirect):
+    if not opened and not blockers and not (remote and failed_redirect):
         lines.append(
             "Если ни одно устройство не открылось, проверьте перенаправление микрофона "
             "в клиенте RDP («Локальные ресурсы» → «Звук» → «Параметры» → «Запись с "
