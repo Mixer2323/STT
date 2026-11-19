@@ -9,7 +9,7 @@ from .environment import prepare as _prepare_environment
 # python -m voicetyper) imports this package before any third-party module.
 _prepare_environment()
 
-__version__ = "1.0.13"
+__version__ = "1.0.14"
 APP_NAME = "VoiceTyper"
 
 
