@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+import voicetyper.audio as audio
 from voicetyper.audio import (
     StreamingDownsampler,
     is_effectively_silent,
@@ -12,6 +13,7 @@ from voicetyper.audio import (
     save_wav,
     trim_silence,
 )
+from voicetyper.config import Config
 
 
 def _tone(seconds: float = 1.0, rate: int = 16000, amplitude: float = 0.4) -> np.ndarray:
@@ -61,3 +63,22 @@ class ReadableResampler:
         from voicetyper.audio import _resample_float
 
         return _resample_float(data, source, target)
+
+
+def test_stereo_capture_is_downmixed_not_left_only() -> None:
+    stereo = np.array([[1000, 3000], [-1000, 1000], [32767, 32767]], dtype=np.int16)
+
+    mixed = audio._downmix_int16(stereo)
+
+    # A microphone wired to the right channel only must not record silence.
+    assert mixed.tolist() == [2000, 0, 32767]
+    assert mixed.dtype == np.int16
+
+
+def test_capture_callback_stores_a_downmixed_mono_block() -> None:
+    session = audio.RecordingSession(Config())
+    session._callback(
+        np.array([[1000, 3000], [2000, 2000]], dtype=np.int16), 2, None, None
+    )
+
+    assert session._chunks[0].tolist() == [2000, 2000]

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import pytest
 
+import voicetyper.hotkeys as hotkeys_module
+from voicetyper.config import ConfigStore
 from voicetyper.hotkeys import (
     HotkeyError,
+    HotkeyManager,
     ensure_hotkey_is_safe,
     hotkey_from_capture,
     hotkey_name_from_event,
@@ -80,3 +83,57 @@ def test_hotkey_from_capture_rejects_bare_regular_key() -> None:
     with pytest.raises(HotkeyError):
         hotkey_from_capture([], "a")
     assert hotkey_from_capture([], "f10") == "f10"
+
+
+class _FakeKeyboard:
+    """Only what ``HotkeyManager.start`` touches."""
+
+    def __init__(self, *, hook_fails: bool) -> None:
+        self.hook_fails = hook_fails
+        self.registered: list[str] = []
+        self.removed: list[object] = []
+
+    def add_hotkey(self, combo, callback, suppress=False, trigger_on_release=False):
+        self.registered.append(combo)
+        return object()
+
+    def hook(self, callback, suppress=False):
+        if self.hook_fails:
+            raise RuntimeError("hook failed")
+        return lambda: None
+
+    def remove_hotkey(self, handler):
+        self.removed.append(handler)
+
+    def unhook(self, hook):
+        pass
+
+    def normalize_name(self, name: str) -> str:
+        return name
+
+    def parse_hotkey(self, text: str):
+        return [(part,) for part in text.split("+")]
+
+    def key_to_scan_codes(self, name: str):
+        return ()
+
+    def is_pressed(self, name: str) -> bool:
+        return False
+
+
+def test_suppressing_hotkey_is_removed_when_the_hook_fails(tmp_path, monkeypatch) -> None:
+    # A partially registered hotkey with suppress=True swallows the key in every
+    # application; start() must undo the registration when a later step fails.
+    fake = _FakeKeyboard(hook_fails=True)
+    monkeypatch.setattr(hotkeys_module, "keyboard", fake)
+    monkeypatch.setattr(hotkeys_module, "HAS_KEYBOARD", True)
+    store = ConfigStore(tmp_path / "config.json")
+    store.load()
+    manager = HotkeyManager(store, on_press=lambda: None, on_release=lambda: None)
+
+    with pytest.raises(HotkeyError):
+        manager.start()
+
+    assert fake.registered == ["ctrl+alt+space"]
+    assert len(fake.removed) == 1
+    assert manager.running is False

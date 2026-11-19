@@ -130,6 +130,18 @@ def test_reports_failure_when_sendinput_is_blocked(monkeypatch: pytest.MonkeyPat
     assert not insertion.type_scancodes("и", delay_ms=0)
 
 
+def test_unicode_fallback_characters_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(insertion, "_user32", lambda: FakeUser32())
+
+    result = insertion.insert_text(
+        "^😀", Config(insert_mode="type_scancode", type_delay_ms=0)
+    )
+
+    assert result.inserted
+    # "^" is a Ctrl shortcut and "😀" has no key: both go through Unicode.
+    assert result.unicode_fallback == 2
+
+
 def test_off_windows_there_is_no_sendinput(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(insertion, "_user32", lambda: None)
 
@@ -213,6 +225,66 @@ def test_paste_keeps_the_new_clipboard_when_the_target_changed_it(
     assert restored == []
 
 
+def test_paste_waits_for_the_configured_restore_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A slow target reads the clipboard after Ctrl+V: restoring it too early
+    # makes that application paste the old contents instead of the dictation.
+    sleeps: list[float] = []
+    monkeypatch.setattr(insertion, "_snapshot_clipboard", lambda: [(8, b"DIB")])
+    monkeypatch.setattr(insertion, "_copy", lambda _text: None)
+    monkeypatch.setattr(insertion, "_send_paste", lambda: None)
+    monkeypatch.setattr(insertion.time, "sleep", lambda value: sleeps.append(value))
+    monkeypatch.setattr(insertion, "_clipboard_sequence", lambda: 5)
+    monkeypatch.setattr(insertion, "_restore_clipboard", lambda _snap: True)
+
+    result = insertion.insert_text(
+        "привет",
+        Config(insert_mode="paste", paste_delay_ms=70, restore_delay_ms=450),
+    )
+
+    assert result.clipboard_restored
+    assert sleeps == [0.07, 0.45]
+
+
+def test_closed_target_window_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(insertion, "is_window", lambda _hwnd: False)
+    monkeypatch.setattr(insertion, "_copy", lambda _text: None)
+    monkeypatch.setattr(insertion, "_send_paste", lambda: None)
+    monkeypatch.setattr(insertion.time, "sleep", lambda _value: None)
+    monkeypatch.setattr(insertion, "_clipboard_sequence", lambda: 5)
+
+    result = insertion.insert_text(
+        "привет",
+        Config(insert_mode="paste", restore_clipboard=False),
+        target=insertion.WindowTarget(hwnd=42, title="Блокнот"),
+    )
+
+    assert result.inserted
+    assert result.target_missing
+
+
+def test_existing_target_window_is_not_marked_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(insertion, "is_window", lambda _hwnd: True)
+    monkeypatch.setattr(insertion, "focus_window", lambda _hwnd: True)
+    monkeypatch.setattr(insertion, "_copy", lambda _text: None)
+    monkeypatch.setattr(insertion, "_send_paste", lambda: None)
+    monkeypatch.setattr(insertion.time, "sleep", lambda _value: None)
+    monkeypatch.setattr(insertion, "_clipboard_sequence", lambda: 5)
+
+    result = insertion.insert_text(
+        "привет",
+        Config(insert_mode="paste", restore_clipboard=False),
+        target=insertion.WindowTarget(hwnd=42, title="Блокнот"),
+    )
+
+    assert result.inserted
+    assert not result.target_missing
+    assert result.target_focused is True
+
+
 def test_paste_does_not_snapshot_when_restore_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -245,3 +317,51 @@ def test_clipboard_snapshot_requires_win32(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert insertion._snapshot_clipboard() is None
     assert insertion._restore_clipboard([(8, b"DIB")]) is False
+
+
+class _ClipboardUser32:
+    def __init__(self, *, failures: int = 0) -> None:
+        self.failures = failures
+        self.opened = 0
+        self.emptied = False
+        self.events: list[str] = []
+
+    def OpenClipboard(self, _hwnd):
+        self.opened += 1
+        if self.opened <= self.failures:
+            raise OSError("clipboard busy")
+        return True
+
+    def EmptyClipboard(self):
+        self.emptied = True
+        self.events.append("empty")
+        return True
+
+    def SetClipboardData(self, _fmt, _handle):
+        self.events.append("set")
+        return True
+
+    def CloseClipboard(self):
+        self.events.append("close")
+        return True
+
+
+def test_empty_clipboard_is_restored_by_clearing_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The user's clipboard was empty before dictation: "restore" means the
+    # dictated text must not stay there.
+    user32 = _ClipboardUser32()
+    monkeypatch.setattr(insertion, "_user32", lambda: user32)
+    monkeypatch.setattr(insertion, "_kernel32", lambda: object())
+
+    assert insertion._restore_clipboard([]) is True
+    assert user32.emptied is True
+
+
+def test_clipboard_open_is_retried_after_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    user32 = _ClipboardUser32(failures=2)
+    monkeypatch.setattr(insertion, "_user32", lambda: user32)
+    monkeypatch.setattr(insertion, "_kernel32", lambda: object())
+    monkeypatch.setattr(insertion.time, "sleep", lambda _value: None)
+
+    assert insertion._restore_clipboard([]) is True
+    assert user32.opened == 3

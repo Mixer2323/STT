@@ -12,8 +12,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
-logger = logging.getLogger(__name__)
+from .constants import HISTORY_VERSION
 
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class HistoryEntry:
@@ -78,7 +79,7 @@ class HistoryStore:
     def _initialize(self) -> None:
         with self._lock, closing(self._connect()) as connection, connection:
             connection.executescript(_SCHEMA)
-            connection.execute("PRAGMA user_version=1")
+            connection.execute(f"PRAGMA user_version={int(HISTORY_VERSION)}")
 
     def add(
         self,
@@ -185,11 +186,23 @@ class HistoryStore:
             with self._lock, closing(self._connect()) as connection, connection:
                 connection.execute("DELETE FROM entries")
                 connection.commit()
-                connection.execute("VACUUM")
+                try:
+                    connection.execute("VACUUM")
+                except sqlite3.DatabaseError:
+                    # VACUUM is an optimization; the rows are already deleted.
+                    logger.debug("VACUUM не удался", exc_info=True)
             return True
         except Exception:
             logger.exception("Не удалось очистить историю")
             return False
+
+    @staticmethod
+    def _csv_safe(value: object) -> object:
+        """Neutralize spreadsheet formulas in exported text."""
+        text = str(value)
+        if text[:1] in ("=", "+", "-", "@"):
+            return "'" + text
+        return value
 
     def export_csv(self, destination: Path | str) -> Path:
         destination = Path(destination)
@@ -208,9 +221,9 @@ class HistoryStore:
                         entry.engine,
                         entry.language,
                         f"{entry.duration:.1f}",
-                        entry.app,
+                        self._csv_safe(entry.app),
                         entry.status,
-                        entry.text,
+                        self._csv_safe(entry.text),
                     ]
                 )
         return destination

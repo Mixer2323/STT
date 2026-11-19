@@ -130,6 +130,11 @@ python -m voicetyper
 `config.json` рядом с программой импортируется в `%LOCALAPPDATA%` при первом
 запуске; исходный файл не удаляется.
 
+При запуске приложение удаляет из `tmp\` записи старше 6 часов (оставшиеся
+после аварийного завершения) и `*.part` старше суток в каталоге моделей.
+Каталоги `models--*`, оставшиеся от прежней версии приложения, не используются:
+их можно удалить через меню трея «Очистить старые кэши моделей…».
+
 **Портативный режим**: создайте пустой файл `portable.txt` рядом с
 `VoiceTyper.exe`. Состояние будет храниться в `data\`, модели — в
 `data\models\` (или в существующей папке `models\` рядом с `.exe`).
@@ -177,9 +182,13 @@ GigaAM v3 скачивается с Hugging Face (`istupakov/gigaam-v3-onnx`) �
 Частичные файлы у каждого источника свои, поэтому переключение между ними не
 портит докачку. Для собственного зеркала задайте
 `VOICETYPER_GIGASTT_MIRROR` — базовый URL, откуда четыре файла GigaAM доступны
-под своими именами.
+под своими именами. Зеркало должно отдавать файлы GitHub-релиза: их размер и
+SHA-256 проверяются так же, как при загрузке с GitHub.
 
-T-one и Faster-Whisper скачиваются с Hugging Face.
+T-one и Faster-Whisper скачиваются с Hugging Face. Версии репозиториев
+зафиксированы (`WHISPER_REVISIONS`, `TONE_REVISION`), а большие LFS-файлы
+дополнительно проверяются по SHA-256, поэтому обновление модели в репозитории
+не меняет то, что загружает приложение, без выпуска новой версии.
 
 ## Настройки
 
@@ -195,13 +204,15 @@ T-one и Faster-Whisper скачиваются с Hugging Face.
 | `whisper_model` | `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` | `large-v3-turbo` |
 | `tone_decoder` | `auto`, `beam_search`, `greedy` | `auto` |
 | `device` | `auto`, `cpu`, `cuda` | `auto` |
-| `compute_type` | `auto`, `int8`, `float16`, `int8_float16` | `auto` |
+| `compute_type` | `auto`, `int8`, `int8_float16`, `float16`, `float32` | `auto` |
 | `input_device` | индекс или имя микрофона | системный |
+| `sample_rate` | 8000–48000 (для распознавания рекомендуется 16 000) | `16000` |
 | `max_recording_seconds` | 10–3600 | `300` |
 | `insert_mode` | `paste`, `clipboard`, `type`, `type_scancode` | `paste` |
 | `restore_clipboard` | `true`/`false` | `true` |
 | `restore_target_window` | `true`/`false` | `true` |
 | `paste_delay_ms` | 0–2000 | `80` |
+| `restore_delay_ms` | 0–2000 | `300` |
 | `type_delay_ms` | 0–500 | `12` |
 | `trim_silence` | `true`/`false` | `true` |
 | `capitalize` | `true`/`false` | `true` |
@@ -214,6 +225,16 @@ T-one и Faster-Whisper скачиваются с Hugging Face.
 | `streaming_preview` | `true`/`false` | `true` |
 | `autostart` | `true`/`false` | `false` |
 | `single_instance` | `true`/`false` | `true` |
+| `warmup_microphone` | `true`/`false` | `true` |
+| `unload_model_after_minutes` | 0–240 (0 — никогда) | `0` |
+
+`warmup_microphone` один раз открывает микрофон при старте и сразу закрывает
+его: первая диктовка начинается быстрее, но индикатор записи не включается и
+файлы не создаются.
+
+`unload_model_after_minutes` выгружает модель из RAM/VRAM после указанного
+времени без записи и распознавания; при следующей диктовке она загружается
+снова. Выгрузить модель вручную можно из меню трея.
 
 `exclude_phrases` отменяет вставку, только если распознанный текст состоит из
 этой фразы (возможно, повторённой). Фраза внутри длинной диктовки ничего не
@@ -222,7 +243,9 @@ T-one и Faster-Whisper скачиваются с Hugging Face.
 ## Командная строка
 
 ```text
-VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--audio-test] [--verbose] [--version]
+VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--audio-test]
+               [--transcribe FILE [FILE ...]] [--engine NAME] [--language CODE]
+               [--out-dir DIR] [--verbose] [--version]
 ```
 
 - `--settings` — открыть настройки при запуске;
@@ -232,8 +255,23 @@ VoiceTyper.exe [--settings] [--minimized] [--diagnostics] [--audio-test] [--verb
 - `--audio-test` — по очереди открыть все микрофоны (WASAPI в общем и
   монопольном режиме) и сохранить отчёт `audio-test_*.txt` в `diagnostics\`,
   не запуская приложение;
+- `--transcribe` — распознать один или несколько аудиофайлов и напечатать текст,
+  не запуская приложение (трей и горячая клавиша не поднимаются). Модель
+  загружается (при первом запуске — скачивается); код возврата 1, если хотя бы
+  один файл не распознан;
+- `--engine` — движок для `--transcribe` (`auto`, `gigaam`, `faster_whisper`,
+  `tone`), по умолчанию берётся из настроек;
+- `--language` — язык для `--transcribe` (по умолчанию из настроек; действует
+  только на Faster-Whisper);
+- `--out-dir` — сохранить результат рядом в виде `DIR\<имя файла>.txt`;
 - `--verbose` — подробные логи;
 - `--version` — версия.
+
+Пример пакетной расшифровки:
+
+```powershell
+VoiceTyper.exe --transcribe .\запись1.wav .\запись2.m4a --out-dir .\тексты
+```
 
 ## Сборка
 
@@ -280,7 +318,9 @@ ruff check .
    переносом буфера обмена подходит `type_scancode` — он печатает текст
    физическими клавишами и не трогает буфер.
 4. Если модель не загрузилась, в трее отображается ошибка; после устранения
-   причины выберите «Перезагрузить модель» в меню.
+   причины выберите «Перезагрузить модель» в меню. Пункт «Выгрузить модель»
+   освобождает память вручную, «Очистить старые кэши моделей…» удаляет
+   неиспользуемые каталоги `models--*` от прежних версий.
 5. Если значка не видно, он может быть скрыт Windows в переполнении трея:
    нажмите `^` на панели задач и перетащите значок на панель. Приложение при
    каждом запуске показывает уведомление, что работает в фоне.

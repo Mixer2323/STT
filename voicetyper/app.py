@@ -23,12 +23,19 @@ from .audio import (
 from .autostart import is_enabled as autostart_is_enabled
 from .autostart import is_supported as autostart_supported
 from .autostart import set_enabled as set_autostart_enabled
+from .cleanup import (
+    cleanup_orphan_model_caches,
+    cleanup_stale_files,
+    find_orphan_model_caches,
+    orphan_model_cache_size,
+)
 from .config import Config, ConfigStore
 from .constants import (
     APP_TITLE,
     APP_VERSION,
     ENGINE_LABELS,
     ENGINE_ORDER,
+    LANGUAGES,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_READY,
@@ -36,16 +43,17 @@ from .constants import (
     STATUS_TRANSCRIBING,
 )
 from .diagnostics import collect_diagnostics, open_folder, write_diagnostics
+from .downloads import human_size
 from .engines import resolve_engine_name
 from .hardware import cached_hardware, config_accepts_language
 from .history import HistoryStore
 from .hotkeys import HotkeyError, HotkeyManager, normalize_hotkey
 from .insertion import foreground_window
 from .logging_setup import setup_logging
-from .models import ModelManager, ModelStatus
+from .models import EngineNotReady, ModelManager, ModelStatus
 from .notifications import Notifier
 from .pipeline import PipelineResult, TranscriptionPipeline
-from .postprocess import preview_text
+from .postprocess import clean_transcript, preview_text
 from .settings_ui import SettingsManager
 from .tray import TrayController
 
@@ -71,7 +79,13 @@ class _PreviewSession:
         lease = None
         try:
             lease = models.acquire(timeout=0.2)
-            stream = lease.engine.start_stream()
+            engine = lease.engine
+            if not getattr(engine, "supports_streaming", False):
+                # GigaAM/Whisper have no streaming decoder: skip the lease so the
+                # idle-unload timer is not blocked by a preview that cannot exist.
+                lease.release()
+                return
+            stream = engine.start_stream()
             if stream is None:
                 lease.release()
                 return
@@ -216,6 +230,7 @@ class VoiceTyperApp:
         self._cleanup_lock = threading.Lock()
         self._cleaned = False
         self._started = False
+        self._last_activity = time.monotonic()
 
         self.models.subscribe(self._on_model_status)
 
@@ -235,13 +250,17 @@ class VoiceTyperApp:
             else:
                 logger.warning("pystray недоступен — работа без значка в трее")
                 self._on_tray_ready(None)
-                while (
-                    not self._shutdown_event.is_set()
-                    and self.settings.is_open
-                ):
-                    time.sleep(0.25)
-                if not self._shutdown_event.is_set():
-                    self.shutdown()
+                # Without a tray icon the settings window is the only visible
+                # part of the app. Closing a window that was opened at any point
+                # quits: otherwise a window opened later through the activation
+                # event would leave an invisible process with no way out.
+                window_seen = self.settings.is_open
+                while not self._shutdown_event.wait(0.25):
+                    is_open = self.settings.is_open
+                    if window_seen and not is_open:
+                        self.shutdown()
+                        break
+                    window_seen = window_seen or is_open
         except Exception:
             logger.exception("Критическая ошибка приложения")
             self.shutdown()
@@ -251,6 +270,23 @@ class VoiceTyperApp:
     def _on_tray_ready(self, icon) -> None:
         if self._started:
             return
+        try:
+            self._startup(icon)
+        except Exception as exc:
+            # A half-initialised app (recording without a pipeline, or without a
+            # hotkey) looks alive but does nothing; fail loudly instead.
+            logger.exception("Не удалось инициализировать приложение")
+            self._started = False
+            try:
+                self.notifier.notify(
+                    "Voice Typer", f"Не удалось запустить приложение: {exc}", force=True
+                )
+            except Exception:
+                logger.debug("Не удалось показать уведомление о сбое", exc_info=True)
+            _fatal(f"Не удалось запустить {APP_TITLE}:\n{exc}")
+            self.shutdown()
+
+    def _startup(self, icon) -> None:
         if icon is not None:
             self.notifier.set_icon(icon)
 
@@ -262,7 +298,6 @@ class VoiceTyperApp:
             on_state=self._on_pipeline_state,
             on_result=self._on_pipeline_result,
         )
-        self.models.request(cfg=cfg)
         # Marked ready only after the pipeline exists: a failure in between
         # must not leave an app that records but never transcribes.
         self._started = True
@@ -313,10 +348,45 @@ class VoiceTyperApp:
         if self._open_settings_on_start or self._first_run:
             self.settings.open("main")
 
+        # Hardware probing (nvidia-smi, and on GPU-less machines the ctranslate2
+        # import) can take seconds on a cold start: it must not delay the
+        # global hotkey or the startup notification, so it runs last.
+        self.models.request(cfg=cfg)
+
         if cfg.warmup_microphone:
             threading.Thread(
                 target=self._warm_up_microphone, name="mic-warmup", daemon=True
             ).start()
+        threading.Thread(
+            target=self._idle_unload_loop, name="model-idle-unload", daemon=True
+        ).start()
+
+    def _idle_unload_loop(self) -> None:
+        """Release the model after the configured idle period."""
+        while not self._shutdown_event.wait(30.0):
+            cfg = self.config_store.get()
+            minutes = cfg.unload_model_after_minutes
+            if minutes <= 0:
+                continue
+            if not self.models.ready or self.models.loading:
+                continue
+            if self.is_recording or self._transcribing:
+                continue
+            if self._pipeline is not None and self._pipeline.pending:
+                continue
+            idle_seconds = time.monotonic() - self._last_activity
+            if idle_seconds < minutes * 60:
+                continue
+            if self.models.unload():
+                logger.info(
+                    "Модель выгружена после %d мин бездействия", minutes
+                )
+
+    def _ensure_model_loaded(self) -> None:
+        """Start a background load when the model was unloaded for idling."""
+        if self.models.ready or self.models.loading:
+            return
+        self.models.request()
 
     def _warm_up_microphone(self) -> None:
         """Prepare the capture device so the first dictation starts faster.
@@ -377,21 +447,10 @@ class VoiceTyperApp:
             self._shutdown_started = True
         logger.info("Завершение работы…")
         self._shutdown_event.set()
-        self._abort_recording()
-        try:
-            self.hotkeys.close()
-        except Exception:
-            logger.debug("Ошибка остановки горячей клавиши", exc_info=True)
-        try:
-            self.settings.close()
-        except Exception:
-            logger.debug("Ошибка остановки окна настроек", exc_info=True)
-        if self._pipeline is not None:
-            try:
-                self._pipeline.stop(timeout=3.0)
-            except Exception:
-                logger.debug("Ошибка остановки очереди", exc_info=True)
-        self.tray.dispose()
+        # One teardown path only: duplicating it here and in ``_cleanup`` let the
+        # two copies drift apart (the model and the instance lock were released
+        # by just one of them).
+        self._cleanup()
 
     # -- recordings ------------------------------------------------------
     def toggle_recording(self) -> None:
@@ -403,6 +462,8 @@ class VoiceTyperApp:
     def start_recording(self) -> None:
         if self._shutdown_event.is_set():
             return
+        self._last_activity = time.monotonic()
+        self._ensure_model_loaded()
         with self._recording_lock:
             if self._recording is not None:
                 return
@@ -477,6 +538,34 @@ class VoiceTyperApp:
             return
         self._stop_preview()
 
+        if result.overflowed:
+            # PortAudio reports dropped blocks in its callback status. Without
+            # this warning a buffer overflow silently produces gaps in the
+            # recording and a wrong transcript.
+            logger.warning("Аудиопоток переполнялся — часть звука могла быть потеряна")
+            self.notifier.notify(
+                "Запись",
+                "Аудиоустройство переполняло буфер: часть звука потеряна. "
+                "Закройте приложения, нагружающие диск или процессор, и попробуйте снова.",
+                key="audio-overflow",
+                cooldown=120.0,
+            )
+
+        if result.capture_error:
+            # The capture device died or was invalidated while recording. The
+            # audio before that point is still transcribed, but without this
+            # warning the dictation simply ends early and looks like a model
+            # failure.
+            logger.warning("Захват звука прервался: %s", result.capture_error)
+            if result.path is not None:
+                self.notifier.notify(
+                    "Запись",
+                    f"Захват звука прервался ({result.capture_error}): записана только "
+                    f"часть диктовки ({result.duration:.1f} с).",
+                    key="capture-error",
+                    cooldown=120.0,
+                )
+
         if result.error:
             logger.info("Запись не отправлена: %s", result.error)
             if result.silent:
@@ -499,6 +588,7 @@ class VoiceTyperApp:
             return
 
         self._transcribing = True
+        self._last_activity = time.monotonic()
         job_id = self._pipeline.submit(
             result.path,
             result.duration,
@@ -516,17 +606,19 @@ class VoiceTyperApp:
                 return
         self.stop_recording()
 
-    def refresh_audio_devices(self) -> None:
+    def refresh_audio_devices(self, *, force: bool = True) -> None:
         """Re-enumerate PortAudio unless a recording is using it.
 
         ``refresh_input_devices`` calls PortAudio's ``_terminate/_initialize``,
         which must not run while a stream is open, so it is serialised with
-        ``start_recording`` through the same lock.
+        ``start_recording`` through the same lock. ``force=False`` keeps the
+        5-second throttle: opening the settings window must not re-initialise
+        the audio stack when the device list was refreshed a moment ago.
         """
         with self._recording_lock:
             if self._recording is not None:
                 return
-            refresh_input_devices()
+            refresh_input_devices(force=force)
 
     def _abort_recording(self) -> None:
         with self._recording_lock:
@@ -603,6 +695,8 @@ class VoiceTyperApp:
             self._last_model_error = status.error
         else:
             self._last_model_error = ""
+            if status.state == STATUS_READY:
+                self._last_activity = time.monotonic()
 
         if self.is_recording or self._transcribing:
             return
@@ -647,6 +741,7 @@ class VoiceTyperApp:
         self._restore_tray_state()
 
     def _on_pipeline_result(self, result: PipelineResult) -> None:
+        self._last_activity = time.monotonic()
         if result.error:
             self.notifier.notify(
                 "Распознавание",
@@ -673,6 +768,33 @@ class VoiceTyperApp:
                 key="clipboard",
                 cooldown=2.0,
             )
+            return
+        if insertion.target_missing:
+            self.notifier.notify(
+                "Вставка",
+                "Окно, активное в начале записи, закрылось: текст вставлен в текущее "
+                "активное окно. Проверьте, куда он попал.",
+                key="target-missing",
+                cooldown=60.0,
+            )
+            return
+        if insertion.target_focused is False:
+            self.notifier.notify(
+                "Вставка",
+                "Не удалось вернуть фокус в окно, активное при начале записи. "
+                "Текст мог попасть в другое окно — проверьте, куда он вставился.",
+                key="focus-restore",
+                cooldown=60.0,
+            )
+        if insertion.unicode_fallback:
+            self.notifier.notify(
+                "Вставка",
+                f"{insertion.unicode_fallback} символ(ов) не имеют клавиши на текущей "
+                "раскладке и переданы как Unicode: в сеансе RDP такие символы могут "
+                "потеряться. Для RDP используйте Ctrl+V или проверьте раскладку.",
+                key="unicode-fallback",
+                cooldown=30.0,
+            )
 
     # -- user actions (tray / hotkeys) ----------------------------------
     def open_settings(self, tab: Optional[str] = None) -> None:
@@ -689,6 +811,50 @@ class VoiceTyperApp:
 
     def open_models_dir(self) -> None:
         self._open_path(paths.models_dir(), "Модели")
+
+    def cleanup_old_model_caches(self) -> None:
+        """Remove HF cache folders that the current layout no longer uses."""
+        caches = find_orphan_model_caches()
+        if not caches:
+            self.notifier.notify(
+                "Модели",
+                "Старые кэши моделей не найдены.",
+                key="old-caches",
+                cooldown=3.0,
+            )
+            return
+        total = orphan_model_cache_size(caches)
+        question = (
+            f"Удалить {len(caches)} каталог(ов) старых кэшей моделей "
+            f"({human_size(total)})?\n\n"
+            "Текущие модели и настройки не затрагиваются: удаляются только "
+            "каталоги models--*, оставшиеся от прежней версии приложения."
+        )
+        if not self._confirm(question, "Очистка старых моделей"):
+            return
+        removed, freed = cleanup_orphan_model_caches()
+        self.notifier.notify(
+            "Модели",
+            f"Удалено каталогов: {removed}, освобождено {human_size(freed)}.",
+            force=True,
+        )
+
+    def _confirm(self, message: str, title: str) -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+
+            MB_YESNO = 0x00000004
+            MB_ICONQUESTION = 0x00000020
+            IDYES = 6
+            result = ctypes.windll.user32.MessageBoxW(
+                None, message, title, MB_YESNO | MB_ICONQUESTION
+            )
+            return int(result) == IDYES
+        except Exception:
+            logger.debug("Не удалось показать подтверждение", exc_info=True)
+            return False
 
     def _open_path(self, path: Path, title: str) -> None:
         try:
@@ -715,7 +881,49 @@ class VoiceTyperApp:
         return collect_diagnostics(self.config_store, self.models, self.history)
 
     def reload_model(self) -> None:
+        self._last_activity = time.monotonic()
         self.models.request(force=True)
+
+    def reset_hotkey(self) -> None:
+        """Clear a stuck press latch after a lost key-up.
+
+        Windows/RDP can drop the key-up event (the hook is removed while a
+        secure desktop is shown, the client reconnects mid-press). Without a
+        reset the latch stays set and every later press is ignored until the
+        app is restarted.
+        """
+        self.hotkeys.reset_latch()
+        logger.info("Состояние горячей клавиши сброшено")
+        self.notifier.notify(
+            "Горячая клавиша",
+            "Состояние клавиши сброшено. Попробуйте нажать комбинацию снова.",
+            key="hotkey-reset",
+            cooldown=3.0,
+        )
+
+    def unload_model(self) -> None:
+        """Free the model's RAM/VRAM without stopping the application."""
+        if self.is_recording or self._transcribing:
+            self.notifier.notify(
+                "Модель",
+                "Нельзя выгрузить модель во время записи или распознавания.",
+                force=True,
+            )
+            return
+        if self.models.unload():
+            self.notifier.notify(
+                "Модель",
+                "Модель выгружена из памяти. Она загрузится снова при следующей записи.",
+                key="unload",
+                cooldown=2.0,
+            )
+        else:
+            self.notifier.notify(
+                "Модель",
+                "Модель уже выгружена или занята.",
+                key="unload-busy",
+                cooldown=2.0,
+            )
 
     def set_engine(self, name: str) -> None:
         if name not in ENGINE_ORDER:
@@ -763,6 +971,13 @@ class VoiceTyperApp:
 
     def _save(self, **changes) -> Config:
         cfg = self.config_store.update(**changes)
+        if not self.config_store.last_save_ok:
+            self.notifier.notify(
+                "Настройки",
+                "Не удалось сохранить файл настроек: изменение действует до "
+                "перезапуска. Проверьте права на папку данных и место на диске.",
+                force=True,
+            )
         self.tray.refresh_menu()
         self.settings.reload_if_open()
         return cfg
@@ -809,6 +1024,7 @@ class VoiceTyperApp:
                 return False, str(exc)
 
         applied = self.config_store.replace(dataclasses.replace(cfg, hotkey=normalized))
+        saved = self.config_store.last_save_ok
         self.notifier.enabled = applied.notifications
         self.history.update_settings(
             enabled=applied.history_enabled,
@@ -837,6 +1053,17 @@ class VoiceTyperApp:
             self.models.request(force=True, cfg=applied)
 
         notes = ["Настройки применены"]
+        if not saved:
+            notes.append(
+                "не удалось сохранить файл настроек — изменения действуют до перезапуска"
+            )
+            self.notifier.notify(
+                "Настройки",
+                "Не удалось сохранить файл настроек. Изменения применены, но после "
+                "перезапуска будут потеряны. Проверьте права на папку данных и "
+                "свободное место на диске.",
+                force=True,
+            )
         if hotkey_changed and not self.hotkeys.available:
             notes.append("горячая клавиша будет доступна после установки keyboard")
         if applied.single_instance != old.single_instance:
@@ -888,6 +1115,27 @@ def _parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         action="store_true",
         help="проверить все микрофоны и сохранить отчёт в файл, не запуская приложение",
     )
+    parser.add_argument(
+        "--transcribe",
+        nargs="+",
+        metavar="FILE",
+        help="распознать аудиофайлы и напечатать текст, не запуская приложение",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=ENGINE_ORDER,
+        help="движок для --transcribe (по умолчанию — из настроек)",
+    )
+    parser.add_argument(
+        "--language",
+        choices=LANGUAGES,
+        help="язык для --transcribe (по умолчанию — из настроек)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        metavar="DIR",
+        help="записать распознанный текст в DIR/<имя файла>.txt",
+    )
     parser.add_argument("--verbose", action="store_true", help="подробное логирование")
     parser.add_argument("--version", action="store_true", help="показать версию")
     return parser.parse_args(argv)
@@ -917,15 +1165,102 @@ def _report_saved(destination: Path, title: str) -> None:
             pass
 
 
+def _transcribe_files(args, cfg: Config, store: ConfigStore) -> int:
+    """One-shot transcription for ``--transcribe`` (no tray, no hotkey)."""
+    files = [Path(value) for value in args.transcribe]
+    missing = [item for item in files if not item.is_file()]
+    if missing:
+        for item in missing:
+            print(f"Файл не найден: {item}", file=sys.stderr)
+        return 2
+
+    if args.engine and args.engine != cfg.model_type:
+        cfg = dataclasses.replace(cfg, model_type=args.engine)
+    if args.language:
+        cfg = dataclasses.replace(cfg, language=args.language)
+
+    out_dir: Optional[Path] = None
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"Не удалось создать {out_dir}: {exc}", file=sys.stderr)
+            return 2
+
+    models = ModelManager(store)
+    lease = None
+    failures = 0
+    try:
+        models.request(cfg=cfg)
+        print("Загрузка модели…", file=sys.stderr, flush=True)
+        try:
+            lease = models.acquire(timeout=1800.0)
+        except EngineNotReady as exc:
+            print(f"Модель недоступна: {exc}", file=sys.stderr)
+            return 1
+        engine = lease.engine
+        language = None if cfg.language == "auto" else cfg.language
+        for path in files:
+            started = time.monotonic()
+            try:
+                outcome = engine.transcribe(path, language=language)
+            except Exception as exc:
+                print(f"{path}: ошибка распознавания: {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            text = clean_transcript(outcome.text, cfg)
+            if not text:
+                print(f"{path}: речь не распознана", file=sys.stderr)
+                failures += 1
+                continue
+            if len(files) > 1:
+                print(f"== {path.name} ==")
+            print(text)
+            logger.info(
+                "CLI: %s → %d симв. за %.2f с (%s)",
+                path.name,
+                len(text),
+                time.monotonic() - started,
+                lease.name,
+            )
+            if out_dir is not None:
+                destination = out_dir / f"{path.stem}.txt"
+                try:
+                    destination.write_text(text + "\n", encoding="utf-8")
+                except OSError as exc:
+                    print(
+                        f"{path}: не удалось записать {destination}: {exc}",
+                        file=sys.stderr,
+                    )
+                    failures += 1
+    finally:
+        if lease is not None:
+            lease.release()
+        models.shutdown()
+    return 0 if failures == 0 else 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     if args.version:
         print(f"{APP_TITLE} {APP_VERSION}")
         return 0
 
-    paths.ensure_runtime_dirs()
+    try:
+        paths.ensure_runtime_dirs()
+    except OSError as exc:
+        _fatal(
+            f"Не удалось создать каталоги данных:\n{exc}\n\n"
+            "Проверьте права на папку данных или задайте VOICETYPER_DATA_DIR."
+        )
+        return 1
     setup_logging(verbose=args.verbose)
     logger.info("%s %s запускается", APP_TITLE, APP_VERSION)
+    try:
+        cleanup_stale_files()
+    except Exception:
+        logger.debug("Не удалось удалить устаревшие файлы", exc_info=True)
 
     first_run = not paths.config_path().exists() and not paths.legacy_config_path().exists()
     store = ConfigStore(paths.config_path(), legacy_path=paths.legacy_config_path())
@@ -961,6 +1296,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         _report_saved(destination, "Диагностика")
         return 0
+
+    if args.transcribe:
+        return _transcribe_files(args, cfg, store)
 
     instance = None
     if cfg.single_instance:

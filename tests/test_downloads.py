@@ -12,8 +12,10 @@ from voicetyper.downloads import DownloadCancelled, DownloadError, _part_path, d
 
 class _Handler(BaseHTTPRequestHandler):
     payload = b"voice-typer" * 1000
+    requests: list[str] = []
 
     def do_GET(self) -> None:  # noqa: N802
+        type(self).requests.append(self.path)
         if self.path != "/data.bin":
             self.send_error(404)
             return
@@ -47,6 +49,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def server():
+    _Handler.requests.clear()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -130,3 +133,181 @@ def test_existing_file_is_reused(server: str, tmp_path: Path) -> None:
         retries=1,
     )
     assert result == destination
+
+
+def test_corrupted_existing_file_is_downloaded_again(server: str, tmp_path: Path) -> None:
+    destination = tmp_path / "data.bin"
+    # Same size, wrong bytes: the old code trusted the size and kept a
+    # corrupted model file.
+    destination.write_bytes(b"x" * len(_Handler.payload))
+    download_file(
+        server,
+        destination,
+        expected_size=len(_Handler.payload),
+        expected_sha256=hashlib.sha256(_Handler.payload).hexdigest(),
+        retries=1,
+    )
+    assert destination.read_bytes() == _Handler.payload
+
+
+def test_missing_url_is_not_retried(server: str, tmp_path: Path) -> None:
+    missing = server.rsplit("/", 1)[0] + "/missing.bin"
+    with pytest.raises(DownloadError):
+        download_file(missing, tmp_path / "x.bin", retries=3)
+    # A 404 cannot succeed on retry; retrying only slows down failover.
+    assert len(_Handler.requests) == 1
+
+
+def test_hf_offline_uses_the_local_required_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voicetyper.downloads as downloads
+
+    (tmp_path / "model.bin").write_bytes(b"model")
+    monkeypatch.setattr(
+        downloads,
+        "_hf_remote_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
+    )
+
+    result = downloads.download_hf_files(
+        "owner/repo",
+        tmp_path,
+        ["model.bin", "config.json"],
+        required="model.bin",
+    )
+
+    assert result == tmp_path
+
+
+def test_hf_lfs_checksum_mismatch_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import huggingface_hub
+
+    import voicetyper.downloads as downloads
+
+    monkeypatch.setattr(
+        downloads,
+        "_hf_remote_metadata",
+        lambda *_args, **_kwargs: {"model.bin": (5, "0" * 64)},
+    )
+
+    def fake_download(repo_id, filename, local_dir, revision=None):
+        target = Path(local_dir) / filename
+        target.write_bytes(b"hello")
+        return str(target)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    with pytest.raises(DownloadError, match="Контрольная сумма"):
+        downloads.download_hf_files(
+            "owner/repo", tmp_path, ["model.bin"], required="model.bin"
+        )
+    assert not (tmp_path / "model.bin").exists()
+
+
+def _payload() -> bytes:
+    return b"0123456789"
+
+
+def test_hf_truncated_file_is_downloaded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A non-empty but short model.bin used to be accepted forever: the engine
+    # then failed on every start with a native "invalid model" error.
+    import huggingface_hub
+
+    import voicetyper.downloads as downloads
+
+    data = _payload()
+    (tmp_path / "model.bin").write_bytes(data[:3])
+    monkeypatch.setattr(
+        downloads,
+        "_hf_remote_metadata",
+        lambda *_args, **_kwargs: {
+            "model.bin": (len(data), hashlib.sha256(data).hexdigest())
+        },
+    )
+    downloaded: list[str] = []
+
+    def fake_download(repo_id, filename, local_dir, revision=None):
+        downloaded.append(filename)
+        target = Path(local_dir) / filename
+        target.write_bytes(data)
+        return str(target)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    downloads.download_hf_files(
+        "owner/repo", tmp_path, ["model.bin"], required="model.bin"
+    )
+
+    assert downloaded == ["model.bin"]
+    assert (tmp_path / "model.bin").read_bytes() == data
+    assert downloads.manifest_path(tmp_path).exists()
+
+
+def test_hf_verified_files_do_not_need_the_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voicetyper.downloads as downloads
+
+    data = _payload()
+    (tmp_path / "model.bin").write_bytes(data)
+    monkeypatch.setattr(
+        downloads,
+        "_hf_remote_metadata",
+        lambda *_args, **_kwargs: {
+            "model.bin": (len(data), hashlib.sha256(data).hexdigest())
+        },
+    )
+    downloads.download_hf_files(
+        "owner/repo", tmp_path, ["model.bin"], required="model.bin"
+    )
+    assert downloads.manifest_path(tmp_path).exists()
+
+    def offline(*_args, **_kwargs):
+        raise AssertionError("сеть не должна использоваться повторно")
+
+    monkeypatch.setattr(downloads, "_hf_remote_metadata", offline)
+    downloads.download_hf_files(
+        "owner/repo", tmp_path, ["model.bin"], required="model.bin"
+    )
+
+
+def test_hf_manifest_detects_a_file_truncated_after_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import huggingface_hub
+
+    import voicetyper.downloads as downloads
+
+    data = _payload()
+    path = tmp_path / "model.bin"
+    path.write_bytes(data)
+    downloads._write_manifest(
+        tmp_path, {"model.bin": {"size": len(data), "sha256": None}}
+    )
+    path.write_bytes(data[:3])
+    monkeypatch.setattr(
+        downloads,
+        "_hf_remote_metadata",
+        lambda *_args, **_kwargs: {"model.bin": (len(data), None)},
+    )
+    downloaded: list[str] = []
+
+    def fake_download(repo_id, filename, local_dir, revision=None):
+        downloaded.append(filename)
+        target = Path(local_dir) / filename
+        target.write_bytes(data)
+        return str(target)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+
+    downloads.download_hf_files(
+        "owner/repo", tmp_path, ["model.bin"], required="model.bin"
+    )
+
+    assert downloaded == ["model.bin"]
+    assert path.read_bytes() == data

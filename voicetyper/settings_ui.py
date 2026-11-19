@@ -39,37 +39,23 @@ from .hotkeys import (
     hotkey_name_from_event,
     normalize_hotkey,
 )
+from .labels import (
+    COMPUTE_TYPE_LABELS,
+    DEVICE_LABELS,
+    HOTKEY_MODE_LABELS,
+    LANGUAGE_LABELS,
+    TONE_DECODER_LABELS,
+)
 from .model_packs import BACKUP_URLS, MODELS_RELEASE_URL, PACKS
 from .postprocess import preview_text
 
 logger = logging.getLogger(__name__)
 
-_LANG_LABELS = {
-    "auto": "Авто",
-    "ru": "Русский",
-    "en": "English",
-    "de": "Deutsch",
-    "fr": "Français",
-    "es": "Español",
-    "it": "Italiano",
-    "pt": "Português",
-    "zh": "中文",
-    "ja": "日本語",
-}
-_DEVICE_LABELS = {"auto": "Авто", "cpu": "CPU", "cuda": "CUDA"}
-_COMPUTE_LABELS = {
-    "auto": "Авто",
-    "int8": "int8",
-    "int8_float16": "int8_float16",
-    "float16": "float16",
-    "float32": "float32",
-}
-_TONE_LABELS = {
-    "auto": "Авто (по железу)",
-    "beam_search": "Beam search (точнее)",
-    "greedy": "Greedy (легче)",
-}
-_HOTKEY_MODE_LABELS = {"hold": "Удержание", "toggle": "Переключение"}
+_LANG_LABELS = LANGUAGE_LABELS
+_DEVICE_LABELS = DEVICE_LABELS
+_COMPUTE_LABELS = COMPUTE_TYPE_LABELS
+_TONE_LABELS = TONE_DECODER_LABELS
+_HOTKEY_MODE_LABELS = HOTKEY_MODE_LABELS
 _HOTKEY_MODIFIERS = ("ctrl", "alt", "shift", "windows")
 _HOTKEY_MODIFIER_LABELS = {
     "ctrl": "Ctrl",
@@ -80,6 +66,9 @@ _HOTKEY_MODIFIER_LABELS = {
 _HOTKEY_HINT = "Нажмите «Записать» и удерживайте сочетание — вводить вручную не обязательно."
 _CAPTURE_HINT = "Слушаю… Нажмите и удерживайте сочетание. Esc — отмена."
 _CAPTURE_IDLE_MS = 8000
+# Hard safety net: the suppressing global hook must never outlive the capture
+# even if the Tk event loop is stuck.
+_CAPTURE_HARD_TIMEOUT_S = 15.0
 
 
 class _ScrolledFrame(ttk.Frame):
@@ -164,9 +153,17 @@ class SettingsManager:
         if self.is_open:
             self._commands.put(("reload",))
 
-    def close(self) -> None:
+    def close(self, timeout: float = 2.0) -> None:
+        """Ask the Tk thread to close and wait briefly for it to finish."""
         if self.is_open:
             self._commands.put(("close",))
+        thread = self._thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout)
 
     def _run(self, initial_tab: Optional[str]) -> None:
         if sys.platform == "win32":
@@ -207,10 +204,10 @@ class SettingsWindow:
         self._tabs: dict[str, int] = {}
         self._scrolled_frames: dict[int, _ScrolledFrame] = {}
         self._scale = 1.0
-        self._devices = []
         self._device_labels: list[str] = []
         self._device_values: list[object] = []
         self.vars: dict[str, tk.Variable] = {}
+        self._traced: set[str] = set()
         self._history_entries: dict[str, object] = {}
         self._results: queue.Queue[tuple[str, str]] = queue.Queue()
         self._diagnostics_pending = False
@@ -221,6 +218,7 @@ class SettingsWindow:
         self._capture_hook = None
         self._capture_poll_after: Optional[str] = None
         self._capture_timeout_after: Optional[str] = None
+        self._capture_done = threading.Event()
         self._hotkeys_were_running = False
 
         self._configure_root()
@@ -229,6 +227,10 @@ class SettingsWindow:
         self._poll_commands()
 
     # -- window shell ----------------------------------------------------
+    def _tray_available(self) -> bool:
+        tray = getattr(self._app, "tray", None)
+        return bool(getattr(tray, "available", False))
+
     def _configure_root(self) -> None:
         self.root.title(f"{APP_TITLE} — Настройки")
         self.root.option_add("*Font", "{Segoe UI} 10")
@@ -288,6 +290,11 @@ class SettingsWindow:
         ttk.Button(footer, text="Применить", command=self._apply).pack(
             side="right", padx=(0, 8)
         )
+        if not self._tray_available():
+            # Without a tray icon this window is the only way out of the app.
+            ttk.Button(footer, text="Выход", command=self._app.shutdown).pack(
+                side="right", padx=(8, 0)
+            )
         self.status_var = tk.StringVar(value="")
         ttk.Label(footer, textvariable=self.status_var, style="Status.TLabel").pack(
             side="left", fill="x", expand=True
@@ -377,7 +384,7 @@ class SettingsWindow:
         )
         self.device_combo.bind("<MouseWheel>", self._on_form_wheel)
         self.device_combo.grid(row=0, column=0, sticky="ew")
-        ttk.Button(device_frame, text="Обновить", width=10, command=self._refresh_devices).grid(
+        ttk.Button(device_frame, text="Обновить", width=10, command=self._refresh_devices_async).grid(
             row=0, column=1, padx=(6, 0)
         )
         ttk.Label(hotkey_box, text="Микрофон", style="Hint.TLabel").grid(
@@ -458,16 +465,30 @@ class SettingsWindow:
             text="VAD-фильтр Whisper (убирает тишину)",
             variable=self.vars["vad_filter"],
         ).grid(row=7, column=1, sticky="w", pady=2)
+        self.vars["sample_rate"] = tk.StringVar()
+        self._spin_row(
+            engine_box, 8, "Частота распознавания, Гц", self.vars["sample_rate"], 8000, 48000
+        )
+        self.vars["unload_model_after_minutes"] = tk.StringVar()
+        self._spin_row(
+            engine_box,
+            9,
+            "Выгружать модель через, мин (0 — никогда)",
+            self.vars["unload_model_after_minutes"],
+            0,
+            240,
+        )
         ttk.Label(
             engine_box,
             text=(
                 "«Авто» выбирает GigaAM/T-one для русского. GigaAM и T-one "
                 "распознают только русский, поэтому выбор языка доступен лишь "
-                "для Faster-Whisper."
+                "для Faster-Whisper. Частота 16 000 Гц рекомендуется: модели "
+                "обучены на ней, а другое значение требует перересемплинга."
             ),
             style="Hint.TLabel",
             wraplength=int(480 * self._scale),
-        ).grid(row=8, column=1, sticky="w", pady=(4, 0))
+        ).grid(row=10, column=1, sticky="w", pady=(4, 0))
 
         self._register_dirty_traces()
         return 0
@@ -511,20 +532,29 @@ class SettingsWindow:
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["paste_delay_ms"] = tk.StringVar()
         self._spin_row(options, 2, "Задержка перед Ctrl+V, мс", self.vars["paste_delay_ms"], 0, 2000)
+        self.vars["restore_delay_ms"] = tk.StringVar()
+        self._spin_row(
+            options,
+            3,
+            "Пауза перед восстановлением буфера, мс",
+            self.vars["restore_delay_ms"],
+            0,
+            2000,
+        )
         self.vars["type_delay_ms"] = tk.StringVar()
-        self._spin_row(options, 3, "Задержка между клавишами, мс", self.vars["type_delay_ms"], 0, 500)
+        self._spin_row(options, 4, "Задержка между клавишами, мс", self.vars["type_delay_ms"], 0, 500)
         self.vars["trim_silence"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Обрезать тишину в начале и конце", variable=self.vars["trim_silence"]
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["capitalize"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Начинать предложения с заглавной буквы", variable=self.vars["capitalize"]
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
         self.vars["remove_fillers"] = tk.BooleanVar()
         ttk.Checkbutton(
             options, text="Удалять слова-заполнители (ээ, эм, uh, um, «ну,», «это самое»)", variable=self.vars["remove_fillers"]
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
 
         exclude = ttk.LabelFrame(frame, text="Фразы-исключения", padding=10)
         exclude.pack(fill="both", expand=True)
@@ -557,6 +587,11 @@ class SettingsWindow:
         limit_spin.bind("<MouseWheel>", self._on_form_wheel)
         limit_spin.pack(side="left", padx=8)
         ttk.Button(row, text="Очистить историю…", command=self._clear_history).pack(side="left")
+        ttk.Label(
+            box,
+            text="0 — история не сохраняется; после «Применить» галочка выше снимется.",
+            style="Hint.TLabel",
+        ).pack(anchor="w")
 
         privacy = ttk.LabelFrame(frame, text="Логи", padding=10)
         privacy.pack(fill="x", pady=(0, 10))
@@ -812,13 +847,19 @@ class SettingsWindow:
         return spin
 
     def _register_dirty_traces(self) -> None:
-        for variable in self.vars.values():
+        # Called once per tab: only newly created variables get a trace, so a
+        # change does not run ``_mark_dirty`` twice for every earlier field.
+        for name, variable in self.vars.items():
+            if name in self._traced:
+                continue
             try:
                 variable.trace_add("write", self._mark_dirty)
             except Exception:
-                pass
-        if hasattr(self, "exclude_text"):
+                continue
+            self._traced.add(name)
+        if hasattr(self, "exclude_text") and "exclude_text" not in self._traced:
             self.exclude_text.bind("<<Modified>>", self._on_text_modified)
+            self._traced.add("exclude_text")
 
     def _mark_dirty(self, *_args) -> None:
         if not self._loading:
@@ -856,11 +897,16 @@ class SettingsWindow:
             self.vars["compute_type"].set(_COMPUTE_LABELS.get(cfg.compute_type, cfg.compute_type))
             self.vars["beam_size"].set(str(cfg.beam_size))
             self.vars["vad_filter"].set(cfg.vad_filter)
+            self.vars["sample_rate"].set(str(cfg.sample_rate))
+            self.vars["unload_model_after_minutes"].set(
+                str(cfg.unload_model_after_minutes)
+            )
             self.vars["max_recording_seconds"].set(str(cfg.max_recording_seconds))
             self.vars["insert_mode"].set(cfg.insert_mode)
             self.vars["restore_clipboard"].set(cfg.restore_clipboard)
             self.vars["restore_target_window"].set(cfg.restore_target_window)
             self.vars["paste_delay_ms"].set(str(cfg.paste_delay_ms))
+            self.vars["restore_delay_ms"].set(str(cfg.restore_delay_ms))
             self.vars["type_delay_ms"].set(str(cfg.type_delay_ms))
             self.vars["trim_silence"].set(cfg.trim_silence)
             self.vars["capitalize"].set(cfg.capitalize)
@@ -882,31 +928,59 @@ class SettingsWindow:
         finally:
             self._loading = False
 
-    def _refresh_devices(self) -> None:
+    def _device_choices(self) -> tuple[list[str], list[object]]:
+        if not HAS_SOUNDDEVICE:
+            return ["sounddevice не установлен"], [None]
+        labels: list[str] = ["Системный по умолчанию (как в Windows)"]
+        values: list[object] = [None]
+        for device in visible_input_devices():
+            labels.append(f"{device.index}: {device.label()}")
+            values.append(device.index)
+        return labels, values
+
+    def _apply_device_choices(
+        self, labels: list[str], values: list[object], selected_text: Optional[str] = None
+    ) -> None:
+        previous_loading = self._loading
+        self._loading = True
+        try:
+            self._device_labels = labels
+            self._device_values = values
+            self.device_combo.configure(values=labels)
+            if not labels:
+                self.device_combo.set("")
+                return
+            if selected_text not in labels:
+                self.device_combo.set(labels[0])
+        finally:
+            self._loading = previous_loading
+
+    def _refresh_devices(self, *, force: bool = False) -> None:
         # PortAudio caches the device list; in an RDP session it is rebuilt
         # when the client connects, so re-enumerate before showing the list.
         # The app serialises this with recording so an open stream is never
-        # torn down by PortAudio's _terminate/_initialize.
-        self._app.refresh_audio_devices()
-        self._devices = visible_input_devices()
-        self._device_labels = ["Системный по умолчанию (как в Windows)"]
-        self._device_values = [None]
-        for device in self._devices:
-            self._device_labels.append(f"{device.index}: {device.label()}")
-            self._device_values.append(device.index)
-        if not HAS_SOUNDDEVICE:
-            self._device_labels = ["sounddevice не установлен"]
-            self._device_values = [None]
-        self.device_combo.configure(values=self._device_labels)
-        if not self._device_labels:
-            self.device_combo.set("")
-            return
-        current = self.vars.get("input_device")
-        if current is None:
-            self.vars["input_device"] = tk.StringVar()
-            self.device_combo.configure(textvariable=self.vars["input_device"])
-        if self.vars["input_device"].get() not in self._device_labels:
-            self.device_combo.set(self._device_labels[0])
+        # torn down by PortAudio's _terminate/_initialize. The initial load is
+        # throttled (the startup warm-up normally refreshed the list already);
+        # the "Обновить" button forces a rebuild.
+        self._app.refresh_audio_devices(force=force)
+        labels, values = self._device_choices()
+        self._apply_device_choices(labels, values, self.vars["input_device"].get())
+
+    def _refresh_devices_async(self) -> None:
+        """Refresh the list without freezing the Tk event loop."""
+        # Tk variables must only be touched on the Tk thread: capture the
+        # current selection before the worker starts.
+        selected = self.vars["input_device"].get()
+
+        def work() -> None:
+            try:
+                self._app.refresh_audio_devices(force=True)
+                labels, values = self._device_choices()
+                self._results.put(("devices", (labels, values, selected)))
+            except Exception:
+                logger.debug("Не удалось обновить список микрофонов", exc_info=True)
+
+        threading.Thread(target=work, name="settings-devices", daemon=True).start()
 
     def _select_input_device(self, value) -> None:
         if value not in self._device_values and value is not None:
@@ -958,8 +1032,28 @@ class SettingsWindow:
             self._set_hotkey_hint(f"Не удалось перехватить клавиатуру: {exc}", error=True)
             self._resume_hotkeys()
             return
+        self._capture_done.clear()
+        threading.Thread(
+            target=self._capture_watchdog,
+            args=(self._capture_hook,),
+            name="hotkey-capture-watchdog",
+            daemon=True,
+        ).start()
         self._schedule_capture_timeout()
         self._poll_capture()
+
+    def _capture_watchdog(self, hook) -> None:
+        """Release the system-wide suppressing hook even if Tk is stuck."""
+        if self._capture_done.wait(_CAPTURE_HARD_TIMEOUT_S):
+            return
+        logger.warning(
+            "Захват комбинации не завершился за %.0f с — перехват клавиатуры снят",
+            _CAPTURE_HARD_TIMEOUT_S,
+        )
+        try:
+            hook()
+        except Exception:
+            logger.debug("Watchdog не смог снять перехват", exc_info=True)
 
     def _on_key_event(self, event) -> bool:
         # Runs on the keyboard hook thread; keep it cheap and swallow the key.
@@ -1030,6 +1124,7 @@ class SettingsWindow:
             self._capture_poll_after = None
         hook = self._capture_hook
         self._capture_hook = None
+        self._capture_done.set()
         if hook is not None:
             try:
                 hook()
@@ -1119,6 +1214,7 @@ class SettingsWindow:
             return
         if self._capturing:
             self._capturing = False
+            self._capture_done.set()
             hook = self._capture_hook
             self._capture_hook = None
             if hook is not None:
@@ -1142,6 +1238,15 @@ class SettingsWindow:
     def _apply(self) -> None:
         if self._capturing:
             self._finish_capture(None, "")
+        if self._app.is_recording:
+            messagebox.showwarning(
+                "Идёт запись",
+                "Дождитесь окончания записи, чтобы применить настройки: "
+                "смена движка или способа вставки во время диктовки даёт "
+                "непредсказуемый результат.",
+                parent=self.root,
+            )
+            return
         try:
             base = self._store.get()
             raw_hotkey = str(self.vars["hotkey"].get()).strip()
@@ -1191,6 +1296,9 @@ class SettingsWindow:
                 compute_type=compute,
                 beam_size=self._int_value("beam_size", "Beam size", 1, 10),
                 vad_filter=bool(self.vars["vad_filter"].get()),
+                sample_rate=self._int_value(
+                    "sample_rate", "Частота распознавания", 8000, 48000
+                ),
                 max_recording_seconds=self._int_value(
                     "max_recording_seconds", "Максимум записи", 10, 3600
                 ),
@@ -1199,6 +1307,9 @@ class SettingsWindow:
                 restore_clipboard=bool(self.vars["restore_clipboard"].get()),
                 restore_target_window=bool(self.vars["restore_target_window"].get()),
                 paste_delay_ms=self._int_value("paste_delay_ms", "Задержка вставки", 0, 2000),
+                restore_delay_ms=self._int_value(
+                    "restore_delay_ms", "Пауза перед восстановлением буфера", 0, 2000
+                ),
                 type_delay_ms=self._int_value("type_delay_ms", "Задержка между клавишами", 0, 500),
                 trim_silence=bool(self.vars["trim_silence"].get()),
                 capitalize=bool(self.vars["capitalize"].get()),
@@ -1212,6 +1323,9 @@ class SettingsWindow:
                 autostart=bool(self.vars["autostart"].get()),
                 single_instance=bool(self.vars["single_instance"].get()),
                 warmup_microphone=bool(self.vars["warmup_microphone"].get()),
+                unload_model_after_minutes=self._int_value(
+                    "unload_model_after_minutes", "Выгрузка модели", 0, 240
+                ),
             )
         except (ValueError, HotkeyError) as exc:
             messagebox.showerror("Проверьте настройки", str(exc), parent=self.root)
@@ -1366,6 +1480,9 @@ class SettingsWindow:
             if kind == "diagnostics":
                 self._diagnostics_pending = False
                 self._set_diagnostics_text(content)
+            elif kind == "devices":
+                labels, values, selected = content
+                self._apply_device_choices(labels, values, selected)
 
     def _copy_diagnostics(self) -> None:
         content = self.diagnostics_text.get("1.0", "end").strip()

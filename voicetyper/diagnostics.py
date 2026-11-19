@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ from .config import ConfigStore
 from .constants import APP_VERSION
 from .downloads import directory_size, human_size
 from .engines import describe_engines
-from .hardware import detect_hardware, format_bytes
+from .hardware import detect_hardware
 from .history import HistoryStore
 from .models import ModelManager
 
@@ -45,7 +46,7 @@ def collect_diagnostics(
     except Exception:
         pass
     lines.append(f"Железо: {hw.summary()}")
-    lines.append(f"Свободно на диске моделей: {format_bytes(hw.free_disk_gb * 1024**3) if hw.free_disk_gb else '?'}")
+    lines.append(f"Свободно на диске моделей: {human_size(hw.free_disk_gb * 1024**3) if hw.free_disk_gb else '?'}")
     lines.append("")
 
     lines.append("== Распознавание ==")
@@ -74,6 +75,17 @@ def collect_diagnostics(
             lines.append("  каталог отсутствует")
     except OSError as exc:
         lines.append(f"  ошибка чтения: {exc}")
+    try:
+        from .cleanup import find_orphan_model_caches, orphan_model_cache_size
+
+        orphans = find_orphan_model_caches()
+        if orphans:
+            lines.append(
+                f"  старые HF-кэши (не используются, можно удалить из трея): "
+                f"{len(orphans)} шт., {human_size(orphan_model_cache_size(orphans))}"
+            )
+    except Exception as exc:
+        lines.append(f"  не удалось проверить старые кэши: {exc}")
     lines.append("")
 
     lines.append("== Данные ==")
@@ -122,7 +134,26 @@ def collect_diagnostics(
             lines.append(f"  {field}: {value}")
     lines.append("")
     lines.append("Содержимое распознавания и история в диагностику не включаются.")
-    return "\n".join(lines)
+    lines.append("Пути к профилю пользователя заменены на %USERPROFILE%.")
+    return _redact("\n".join(lines))
+
+
+def _redact(text: str) -> str:
+    """Replace the user's profile path before the report leaves the machine."""
+    values: set[str] = set()
+    for variable in ("USERPROFILE", "HOME"):
+        value = os.environ.get(variable, "").strip()
+        if value:
+            values.update({value, value.replace("\\", "/")})
+    try:
+        home = str(Path.home())
+        values.update({home, home.replace("\\", "/")})
+    except Exception:
+        pass
+    for value in sorted(values, key=len, reverse=True):
+        if len(value) > 3:
+            text = re.sub(re.escape(value), "%USERPROFILE%", text, flags=re.IGNORECASE)
+    return text
 
 
 def write_diagnostics(text: str, *, prefix: str = "diagnostics") -> Path:

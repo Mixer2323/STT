@@ -55,6 +55,9 @@ class Config:
     insert_mode: str = "paste"  # paste | clipboard | type | type_scancode
     restore_clipboard: bool = True
     paste_delay_ms: int = 80
+    # How long the target application gets to read the clipboard after Ctrl+V
+    # before the previous clipboard contents are put back.
+    restore_delay_ms: int = 300
     type_delay_ms: int = 12
     restore_target_window: bool = True
     trim_silence: bool = True
@@ -68,6 +71,7 @@ class Config:
     autostart: bool = False
     single_instance: bool = True
     warmup_microphone: bool = True
+    unload_model_after_minutes: int = 0
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -240,6 +244,11 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
         "paste_delay_ms вне диапазона 0..2000",
     )
     check(
+        "restore_delay_ms",
+        lambda v, d: _as_int(v, d, 0, 2000),
+        "restore_delay_ms вне диапазона 0..2000",
+    )
+    check(
         "type_delay_ms",
         lambda v, d: _as_int(v, d, 0, 500),
         "type_delay_ms вне диапазона 0..500",
@@ -248,6 +257,11 @@ def validate_mapping(data: dict[str, Any]) -> tuple[Config, list[str]]:
         "history_limit",
         lambda v, d: _as_int(v, d, 0, 10000),
         "history_limit вне диапазона 0..10000",
+    )
+    check(
+        "unload_model_after_minutes",
+        lambda v, d: _as_int(v, d, 0, 240),
+        "unload_model_after_minutes вне диапазона 0..240",
     )
 
     for name in (
@@ -314,11 +328,18 @@ class ConfigStore:
         self._lock = threading.RLock()
         self._config = Config()
         self._listeners: list[Callable[[Config], None]] = []
+        self._last_save_ok = True
 
     @property
     def config(self) -> Config:
         with self._lock:
             return self._config
+
+    @property
+    def last_save_ok(self) -> bool:
+        """False when the last ``save`` failed (for example a read-only disk)."""
+        with self._lock:
+            return self._last_save_ok
 
     def get(self) -> Config:
         with self._lock:
@@ -373,7 +394,15 @@ class ConfigStore:
 
         with self._lock:
             self._config = cfg
-        if source == self.path or migrated_from_legacy or not self.path.exists():
+        # Rewrite only when the on-disk file is missing, was migrated or
+        # normalized. Writing the same JSON on every start churns the file for
+        # no reason (and touches the disk on every launch).
+        if (
+            migrated_from_legacy
+            or not self.path.exists()
+            or bool(warnings)
+            or raw.get("version") != CONFIG_VERSION
+        ):
             self.save(cfg)
         if migrated_from_legacy:
             warnings.append(f"Настройки перенесены из {source}")
@@ -387,10 +416,14 @@ class ConfigStore:
         payload = asdict(current)
         try:
             _atomic_json_write(self.path, payload)
-            return True
         except Exception:
             logger.exception("Не удалось сохранить конфигурацию в %s", self.path)
+            with self._lock:
+                self._last_save_ok = False
             return False
+        with self._lock:
+            self._last_save_ok = True
+        return True
 
     def update(self, **changes: Any) -> Config:
         with self._lock:

@@ -48,6 +48,10 @@ class InsertionResult:
     clipboard_restored: bool = False
     target_focused: Optional[bool] = None
     error: Optional[str] = None
+    unicode_fallback: int = 0
+    # The window that was active when the recording started no longer exists,
+    # so the text went to whatever happened to be focused.
+    target_missing: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +70,7 @@ _GDI_CLIPBOARD_FORMATS = frozenset(
 )
 _GMEM_MOVEABLE = 0x0002
 _CLIPBOARD_RETRIES = 10
-_MAX_CLIPBOARD_SNAPSHOT = 64 * 1024 * 1024
+_MAX_CLIPBOARD_SNAPSHOT = 16 * 1024 * 1024
 
 _VK_CONTROL = 0x11
 _VK_V = 0x56
@@ -233,7 +237,8 @@ def _open_clipboard(user32) -> bool:
                 return True
         except Exception:
             logger.debug("OpenClipboard не удался", exc_info=True)
-            return False
+        # Another process may hold the clipboard for a moment; keep retrying
+        # instead of giving up on the first error.
         time.sleep(0.02)
     return False
 
@@ -318,15 +323,19 @@ def _snapshot_clipboard() -> Optional[list[tuple[int, bytes]]]:
 
 
 def _restore_clipboard(snapshot: list[tuple[int, bytes]]) -> bool:
-    """Put back a snapshot taken by :func:`_snapshot_clipboard`."""
+    """Put back a snapshot taken by :func:`_snapshot_clipboard`.
+
+    An empty snapshot means the clipboard held nothing before dictation, so a
+    successful restore clears it instead of leaving the recognized text there.
+    """
     user32 = _user32()
     kernel32 = _kernel32()
-    if user32 is None or kernel32 is None or not snapshot:
+    if user32 is None or kernel32 is None or snapshot is None:
         return False
     if not _open_clipboard(user32):
         logger.debug("Буфер обмена занят — восстановление пропущено")
         return False
-    restored = False
+    restored = not snapshot
     try:
         user32.EmptyClipboard()
         for fmt, data in snapshot:
@@ -550,8 +559,18 @@ _SCANCODE_SUBSTITUTES = {
 }
 
 
-def type_scancodes(text: str, *, delay_ms: int = 12) -> bool:
-    """Type ``text`` as physical keystrokes; returns False when Win32 is absent."""
+def type_scancodes(
+    text: str,
+    *,
+    delay_ms: int = 12,
+    fallback_chars: Optional[list[str]] = None,
+) -> bool:
+    """Type ``text`` as physical keystrokes; returns False when Win32 is absent.
+
+    ``fallback_chars`` collects characters that have no key on the active
+    layout and are therefore sent as scan-code-less Unicode events, which a
+    Remote Desktop client silently drops.
+    """
     user32 = _user32()
     if user32 is None:
         return False
@@ -567,6 +586,8 @@ def type_scancodes(text: str, *, delay_ms: int = 12) -> bool:
         for symbol in _SCANCODE_SUBSTITUTES.get(char, char):
             key = _key_for(symbol, hkl, user32)
             if key is None:
+                if fallback_chars is not None:
+                    fallback_chars.append(symbol)
                 events = _unicode_events(symbol)
             else:
                 _vk, scan, flags, needs_shift = key
@@ -612,70 +633,90 @@ def insert_text(
         return InsertionResult(method=cfg.insert_mode, error="Пустой текст")
 
     focused: Optional[bool] = None
+    missing = False
     if target is not None and cfg.restore_target_window:
         if is_window(target.hwnd):
             focused = focus_window(target.hwnd)
             if not focused:
                 logger.warning("Не удалось вернуть фокус в «%s»", target.title)
+        else:
+            # The window disappeared while the user was dictating: the text is
+            # about to go to whatever window is focused now. ``focused`` stays
+            # None ("nothing to restore"), so the caller needs its own signal.
+            missing = True
+            logger.warning(
+                "Окно «%s» закрылось во время диктовки — текст уйдёт в активное окно",
+                target.title,
+            )
+
+    def result(**fields) -> InsertionResult:
+        return InsertionResult(target_missing=missing, **fields)
 
     if cfg.insert_mode == "clipboard":
         try:
             _copy(text)
-            return InsertionResult(
-                method="clipboard",
-                inserted=False,
-                target_focused=focused,
-            )
+            return result(method="clipboard", inserted=False, target_focused=focused)
         except InsertionError as exc:
-            return InsertionResult(method="clipboard", error=str(exc))
+            return result(method="clipboard", error=str(exc))
 
     if cfg.insert_mode == "type":
         if not HAS_KEYBOARD:
-            return InsertionResult(method="type", target_focused=focused, error="keyboard не установлен")
+            return result(method="type", target_focused=focused, error="keyboard не установлен")
         try:
             keyboard.write(text, delay=0.002)
-            return InsertionResult(method="type", inserted=True, target_focused=focused)
+            return result(method="type", inserted=True, target_focused=focused)
         except Exception as exc:
-            return InsertionResult(method="type", target_focused=focused, error=f"Ошибка ввода: {exc}")
+            return result(method="type", target_focused=focused, error=f"Ошибка ввода: {exc}")
 
     if cfg.insert_mode == "type_scancode":
+        fallback: list[str] = []
         try:
-            typed = type_scancodes(text, delay_ms=cfg.type_delay_ms)
+            typed = type_scancodes(
+                text, delay_ms=cfg.type_delay_ms, fallback_chars=fallback
+            )
         except Exception as exc:
-            return InsertionResult(
+            return result(
                 method="type_scancode", target_focused=focused, error=f"Ошибка ввода: {exc}"
             )
         if not typed:
-            return InsertionResult(
+            return result(
                 method="type_scancode",
                 target_focused=focused,
                 error="Win32 SendInput недоступен — текст не введён",
             )
-        return InsertionResult(method="type_scancode", inserted=True, target_focused=focused)
+        return result(
+            method="type_scancode",
+            inserted=True,
+            target_focused=focused,
+            unicode_fallback=len(fallback),
+        )
 
     snapshot = _snapshot_clipboard() if cfg.restore_clipboard else None
     try:
         _copy(text)
     except InsertionError as exc:
-        return InsertionResult(method="paste", target_focused=focused, error=str(exc))
+        return result(method="paste", target_focused=focused, error=str(exc))
 
     ours_sequence = _clipboard_sequence()
     time.sleep(max(0, cfg.paste_delay_ms) / 1000.0)
     try:
         _send_paste()
     except InsertionError as exc:
-        return InsertionResult(method="paste", target_focused=focused, error=str(exc))
+        return result(method="paste", target_focused=focused, error=str(exc))
     except Exception as exc:
-        return InsertionResult(method="paste", target_focused=focused, error=f"Ошибка вставки: {exc}")
+        return result(method="paste", target_focused=focused, error=f"Ошибка вставки: {exc}")
 
     restored = False
     if snapshot is not None:
-        time.sleep(0.2)
+        # The paste is asynchronous: the target application reads the clipboard
+        # after it has processed the keystroke. Restoring too early makes a slow
+        # application paste the *old* clipboard contents.
+        time.sleep(max(0, cfg.restore_delay_ms) / 1000.0)
         current_sequence = _clipboard_sequence()
         if ours_sequence is None or current_sequence == ours_sequence:
             restored = _restore_clipboard(snapshot)
 
-    return InsertionResult(
+    return result(
         method="paste",
         inserted=True,
         clipboard_restored=restored,

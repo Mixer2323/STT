@@ -88,3 +88,41 @@ def test_extract_reports_missing_files(tmp_path: Path) -> None:
         archive.writestr("other.bin", b"x")
     with pytest.raises(DownloadError):
         model_packs._extract(archive_path, tmp_path / "target", pack, None)
+
+
+def test_extract_rejects_an_oversized_archive(tmp_path: Path) -> None:
+    # A swapped download source must not be able to unpack gigabytes (zip bomb).
+    pack = model_packs.ModelPack(
+        key="tone",
+        title="T",
+        asset="tiny.zip",
+        size=1024,
+        sha256="0" * 64,
+        folder=("tone",),
+        files=("model.onnx",),
+    )
+    archive_path = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model.onnx", b"\0" * (20 * 1024 * 1024))
+    with pytest.raises(DownloadError, match="больше ожидаемого"):
+        model_packs._extract(archive_path, tmp_path / "target", pack, None)
+
+
+def test_archive_is_kept_when_unpacking_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The archive is SHA-256 verified, so a failed extraction must not force a
+    # second multi-gigabyte download.
+    pack = model_packs.PACKS["tone"]
+
+    def fake_download(url, destination, **kwargs):
+        with zipfile.ZipFile(destination, "w") as archive:
+            archive.writestr("wrong.bin", b"x")
+        return Path(destination)
+
+    monkeypatch.setattr(model_packs, "download_file", fake_download)
+
+    with pytest.raises(DownloadError):
+        model_packs.download_pack("tone", tmp_path)
+
+    assert (tmp_path / f".{pack.asset}.download").exists()

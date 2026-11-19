@@ -9,6 +9,7 @@ import voicetyper.pipeline as pipeline_module
 from voicetyper.engines.base import TranscriptionResult
 from voicetyper.history import HistoryStore
 from voicetyper.insertion import InsertionResult
+from voicetyper.models import EngineNotReady
 from voicetyper.pipeline import TranscriptionPipeline
 
 
@@ -110,3 +111,56 @@ def test_excluded_phrase_is_not_inserted(tmp_path: Path, monkeypatch: pytest.Mon
     assert not called
     assert harness.history.count() == 0
     harness.pipeline.stop()
+
+
+def test_job_reloads_a_model_unloaded_by_the_idle_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from voicetyper.config import ConfigStore
+
+    class ReloadingModels:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.requested = 0
+            self.loading = False
+            self.status = SimpleNamespace(error=None)
+
+        def request(self, *_args, **_kwargs) -> None:
+            self.requested += 1
+
+        def acquire(self, timeout=0, preferred_name=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise EngineNotReady("Модель ещё не загружена")
+            return FakeLease(FakeEngine())
+
+    models = ReloadingModels()
+    store = ConfigStore(tmp_path / "config.json")
+    store.load()
+    history = HistoryStore(tmp_path / "history.db")
+    results = []
+    done = threading.Event()
+    pipeline = TranscriptionPipeline(
+        models,
+        store,
+        history,
+        on_result=lambda result: (results.append(result), done.set()),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "insert_text",
+        lambda text, cfg, target=None: InsertionResult(method="paste", inserted=True),
+    )
+    path = tmp_path / "audio.wav"
+    path.write_bytes(b"fake")
+
+    try:
+        assert pipeline.submit(path, 1.0) is not None
+        assert done.wait(5)
+        assert results[-1].error is None
+        assert models.requested == 1
+        assert models.calls == 2
+    finally:
+        pipeline.stop()

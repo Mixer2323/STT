@@ -22,21 +22,67 @@ def _sources() -> list[tuple[str, str, dict[str, tuple[str, Optional[int], Optio
     sources = list(GIGASTT_SOURCES)
     mirror = os.environ.get("VOICETYPER_GIGASTT_MIRROR", "").strip().rstrip("/")
     if mirror:
-        # A custom mirror is expected to serve the files under their local names.
-        sources.insert(
-            0,
-            ("зеркало", mirror, {name: (name, None, None) for name in GIGASTT_ASSETS}),
-        )
+        # A custom mirror is expected to serve the GitHub release assets under
+        # their local names. Their sizes and SHA-256 are published, so the
+        # mirror is verified exactly like GitHub instead of being trusted
+        # blindly: an arbitrary ONNX file would otherwise be loaded by a native
+        # engine.
+        github_assets = GIGASTT_SOURCES[-1][2]
+        mirror_assets = {
+            name: (name, github_assets[name][1], github_assets[name][2])
+            for name in GIGASTT_ASSETS
+        }
+        sources.insert(0, ("зеркало", mirror, mirror_assets))
     return sources
 
 
+def _published_sizes() -> dict[str, set[int]]:
+    """Every size a complete asset has in one of the published sources.
+
+    The Hugging Face and GitHub releases carry a differently quantized encoder,
+    so the same file name has two valid sizes. Anything else on disk is a
+    truncated or foreign file and must be downloaded again.
+    """
+    sizes: dict[str, set[int]] = {}
+    for _label, _base_url, assets in GIGASTT_SOURCES:
+        for name, (_remote_name, size, _sha256) in assets.items():
+            if size:
+                sizes.setdefault(name, set()).add(int(size))
+    return sizes
+
+
+def _sizes_ok(model_dir: Path, sizes: dict[str, set[int]] | None = None) -> bool:
+    """True when every asset on disk matches a published size."""
+    expected = sizes if sizes is not None else _published_sizes()
+    for name in GIGASTT_ASSETS:
+        path = model_dir / name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        allowed = expected.get(name)
+        if allowed and size not in allowed:
+            return False
+    return True
+
+
 def _models_ready(model_dir: Path) -> bool:
+    """True only when the complete GigaAM asset set is on disk.
+
+    Checking for "some .onnx and some .txt" used to accept a half-downloaded
+    model: after an interrupted per-file download the encoder and the vocab were
+    present, so the engine stopped re-downloading and every load failed with a
+    native error until the user deleted the folder by hand.
+    """
     if not model_dir.is_dir():
         return False
-    names = {item.name for item in model_dir.iterdir() if item.is_file()}
-    has_onnx = any(name.endswith(".onnx") and (model_dir / name).stat().st_size > 0 for name in names)
-    has_vocab = any(name.endswith(".txt") and (model_dir / name).stat().st_size > 0 for name in names)
-    return has_onnx and has_vocab
+    try:
+        return all(
+            (model_dir / name).is_file() and (model_dir / name).stat().st_size > 0
+            for name in GIGASTT_ASSETS
+        )
+    except OSError:
+        return False
 
 
 def _word_segments(words) -> list[Segment]:
@@ -90,18 +136,32 @@ class GigaAMEngine(Engine):
             raise
         except DownloadError as exc:
             logger.warning("GigaAM: пакет с GitHub недоступен (%s); пофайловая загрузка", exc)
-        if _models_ready(self._model_dir):
+        if _models_ready(self._model_dir) and _sizes_ok(self._model_dir):
             self.report("GigaAM: модель готова", 100.0)
             return
 
         total = len(GIGASTT_ASSETS)
         sources = _sources()
+        published = _published_sizes()
         for index, name in enumerate(GIGASTT_ASSETS):
             self.check_cancelled()
             destination = self._model_dir / name
+            # The two sources ship a differently quantized encoder (same names,
+            # different sizes), so any published size is accepted here. A file
+            # with an unknown size is a truncated download: it must not be
+            # treated as ready just because it is non-empty.
+            known_sizes = published.get(name, set())
             if destination.exists() and destination.stat().st_size > 0:
-                self.report(f"GigaAM: {name} уже загружен", (index + 1) * 100 / total)
-                continue
+                size = destination.stat().st_size
+                if not known_sizes or size in known_sizes:
+                    self.report(f"GigaAM: {name} уже загружен", (index + 1) * 100 / total)
+                    continue
+                logger.warning(
+                    "GigaAM: %s имеет размер %d байт вместо %s — перекачиваю",
+                    name,
+                    size,
+                    " / ".join(str(value) for value in sorted(known_sizes)),
+                )
 
             failures: list[str] = []
             for source_name, base_url, assets in sources:
@@ -152,11 +212,13 @@ class GigaAMEngine(Engine):
             ) from exc
 
         self.report("GigaAM: проверка моделей")
-        if not _models_ready(self._model_dir):
-            self._download()
+        # Always run the check: it is free when the files are complete (the pack
+        # is only looked at, not downloaded) and it replaces a truncated ONNX
+        # file that "is on disk" but can never be loaded.
+        self._download()
         self.check_cancelled()
-        if not _models_ready(self._model_dir):
-            raise EngineError(f"Файлы GigaAM не найдены в {self._model_dir}")
+        if not _models_ready(self._model_dir) or not _sizes_ok(self._model_dir):
+            raise EngineError(f"Файлы GigaAM не найдены или повреждены в {self._model_dir}")
 
         self.report("GigaAM: загрузка в память")
         try:

@@ -60,8 +60,6 @@ def models_dir() -> Path:
     # Existing installations keep their multi-gigabyte downloads where they are.
     if legacy.is_dir():
         return legacy
-    if is_portable():
-        return data_dir() / "models"
     return data_dir() / "models"
 
 

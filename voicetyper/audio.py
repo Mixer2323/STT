@@ -76,6 +76,14 @@ class AudioError(RuntimeError):
     pass
 
 
+# Automatic re-enumeration is throttled: PortAudio's _terminate/_initialize
+# costs 100–1000 ms and must not delay every dictation start.
+_REFRESH_MIN_INTERVAL = 5.0
+_last_refresh_at = 0.0
+# (samplerate, channels) that opened successfully for a device index.
+_FORMAT_CACHE: dict[int, tuple[int, int]] = {}
+
+
 @dataclass(frozen=True)
 class InputDevice:
     index: int
@@ -99,6 +107,10 @@ class RecordingResult:
     silent: bool = False
     error: Optional[str] = None
     peak_dbfs: Optional[float] = None
+    # Set when the capture device died (or was invalidated) mid-recording: the
+    # audio before the failure is still usable, but the user must be told that
+    # the rest of the dictation was never recorded.
+    capture_error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -169,8 +181,6 @@ def default_input_device() -> Optional[InputDevice]:
     for device in list_input_devices():
         if device.index == index:
             return device
-        if index is None and device.name == "default":
-            return device
     return None
 
 
@@ -188,14 +198,22 @@ def is_remote_session() -> bool:
         return False
 
 
-def refresh_input_devices() -> bool:
+def refresh_input_devices(*, force: bool = False) -> bool:
     """Re-enumerate PortAudio devices.
 
     PortAudio caches the device list on initialization. In an RDP session the
     set of audio devices changes when the client connects or disconnects, so
     the cached list (and the default device index) can become stale.
+
+    Re-initializing PortAudio takes 100–1000 ms and must not run before every
+    dictation, so the automatic call from ``RecordingSession.start`` is
+    throttled; the settings button and diagnostics pass ``force=True``.
     """
+    global _last_refresh_at
     if not HAS_SOUNDDEVICE:
+        return False
+    now = time.monotonic()
+    if not force and now - _last_refresh_at < _REFRESH_MIN_INTERVAL:
         return False
     terminate = getattr(sd, "_terminate", None)
     initialize = getattr(sd, "_initialize", None)
@@ -207,6 +225,9 @@ def refresh_input_devices() -> bool:
     except Exception:
         logger.warning("Не удалось обновить список аудиоустройств", exc_info=True)
         return False
+    _last_refresh_at = now
+    # Device indices and the negotiated format may change after re-enumeration.
+    _FORMAT_CACHE.clear()
     logger.debug("Список аудиоустройств обновлён")
     return True
 
@@ -422,7 +443,14 @@ def _soundcard_microphones() -> list[object]:
 
 
 def _find_soundcard_microphone(names: list[str]) -> Optional[object]:
-    """Pick a Media Foundation microphone matching one of ``names``."""
+    """Pick a Media Foundation microphone matching one of ``names``.
+
+    When names are given and none match, the default endpoint is returned only
+    if it is the *only* capture device: RDP localizes the endpoint name, so a
+    single "Remote Audio" device is still the right one. With several devices an
+    unrelated default would silently capture the wrong microphone, so ``None`` is
+    returned instead.
+    """
     if not HAS_SOUNDCARD or os.name != "nt":
         return None
     microphones = _soundcard_microphones()
@@ -438,51 +466,13 @@ def _find_soundcard_microphone(names: list[str]) -> Optional[object]:
                 return microphone
             if name.casefold() in microphone_name.casefold():
                 return microphone
+    if wanted:
+        return microphones[0] if len(microphones) == 1 else None
     try:
         return sc.default_microphone()
     except Exception:
         logger.debug("Не удалось выбрать микрофон по умолчанию", exc_info=True)
         return None
-
-
-def resolve_input_device(value: int | str | None) -> Optional[int]:
-    """Map a config value (index or name) to a sounddevice index.
-
-    Device numbering is not stable across sessions: after an RDP client
-    connects or disconnects the list is rebuilt and the saved index may point
-    to another device or disappear. In that case fall back to the system
-    default instead of making recording impossible.
-    """
-    if not HAS_SOUNDDEVICE:
-        raise AudioError("sounddevice не установлен — запись недоступна")
-    if value is None or value == "":
-        return _system_default_input()
-
-    devices = list_input_devices()
-    if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
-        index = int(value)
-        if any(device.index == index for device in devices):
-            return index
-        logger.warning(
-            "Микрофон с индексом %s не найден — используется системный по умолчанию",
-            index,
-        )
-        return _system_default_input()
-
-    needle = str(value).strip().casefold()
-    exact = [device for device in devices if device.name.casefold() == needle]
-    if exact:
-        return exact[0].index
-    partial = [device for device in devices if needle and needle in device.name.casefold()]
-    if len(partial) == 1:
-        return partial[0].index
-    if len(partial) > 1:
-        names = ", ".join(device.name for device in partial[:4])
-        raise AudioError(f"Название «{value}» подходит к нескольким микрофонам: {names}")
-    logger.warning(
-        "Микрофон «%s» не найден — используется системный по умолчанию", value
-    )
-    return _system_default_input()
 
 
 def target_device_index(value: int | str | None = None) -> Optional[int]:
@@ -538,8 +528,11 @@ def configured_device_name(value: int | str | None) -> str:
 
 
 def _reset_capture_cache() -> None:
-    """Forget the remembered Media Foundation failure (tests and diagnostics)."""
+    """Forget remembered capture state (tests and diagnostics)."""
+    global _last_refresh_at
     _forget_media_foundation_failure()
+    _last_refresh_at = 0.0
+    _FORMAT_CACHE.clear()
 
 
 # A dead endpoint (the RDP "Remote Audio" stub, a disconnected headset) makes
@@ -581,6 +574,18 @@ def _capture_blockers() -> list[str]:
     except Exception:
         logger.debug("Не удалось проверить ограничения записи Windows", exc_info=True)
         return []
+
+
+def _downmix_int16(data: np.ndarray) -> np.ndarray:
+    """Average multi-channel int16 audio into one channel without clipping."""
+    if data.ndim == 1:
+        return data.astype(np.int16, copy=True)
+    if data.shape[1] == 1:
+        return data[:, 0].astype(np.int16, copy=True)
+    # Averaging keeps a microphone that is only wired to the right channel
+    # audible; taking channel 0 used to record silence on such endpoints.
+    summed = data.astype(np.int32).sum(axis=1) // data.shape[1]
+    return np.clip(summed, -32768, 32767).astype(np.int16)
 
 
 def _resample_float(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -857,8 +862,15 @@ class RecordingSession:
         assert sd is not None
         if device_index is None:
             raise AudioError(_no_input_device_message())
+        formats = self._device_formats(device_index)
+        cached = _FORMAT_CACHE.get(int(device_index))
+        if cached is not None and cached in formats:
+            # Start with the combination that worked last time; probing every
+            # format again costs a system call and several hundred milliseconds
+            # on some drivers.
+            formats = [cached] + [item for item in formats if item != cached]
         last_error: Optional[BaseException] = None
-        for rate, channels in self._device_formats(device_index):
+        for rate, channels in formats:
             try:
                 stream = self._open_stream(device_index, rate, channels)
             except Exception as exc:
@@ -871,6 +883,7 @@ class RecordingSession:
                     exc,
                 )
                 continue
+            _FORMAT_CACHE[int(device_index)] = (rate, channels)
             logger.info(
                 "Микрофон открыт: устройство=%s (%s), %d Гц, каналов=%d",
                 device_index,
@@ -922,7 +935,10 @@ class RecordingSession:
         name = _device_name(device_index)
         microphone = _find_soundcard_microphone([name] if name else [])
         if microphone is None:
-            logger.warning("Windows Media Foundation не нашёл ни одного микрофона")
+            logger.warning(
+                "Windows Media Foundation не нашёл микрофон %s",
+                f"«{name}»" if name else "по умолчанию",
+            )
             _remember_media_foundation_failure()
             return False
 
@@ -1001,7 +1017,9 @@ class RecordingSession:
                     if data is None or len(data) == 0:
                         continue
                     if getattr(data, "ndim", 1) > 1:
-                        data = data[:, 0]
+                        # Mean instead of channel 0: a stereo endpoint may put
+                        # the microphone on the right channel only.
+                        data = data.astype(np.float32).mean(axis=1)
                     samples = np.clip(
                         np.asarray(data, dtype=np.float32), -1.0, 1.0
                     )
@@ -1090,6 +1108,9 @@ class RecordingSession:
                 self._device_name = (
                     _device_name(targets[-1]) or self._native_mic_name
                 )
+                # Media Foundation is used precisely in an RDP session, where
+                # the endpoint may belong to the server instead of the client.
+                self.server_side_fallback = _is_server_side_fallback(targets[-1])
                 logger.info(
                     "Запись начата через Windows Media Foundation: устройство=%s, "
                     "%d Гц, каналов=%d",
@@ -1134,7 +1155,7 @@ class RecordingSession:
         if status:
             self._overflowed = True
             logger.debug("Статус аудиопотока: %s", status)
-        chunk = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
+        chunk = _downmix_int16(np.asarray(indata))
         with self._lock:
             if self._stopped:
                 return
@@ -1209,15 +1230,20 @@ class RecordingSession:
             frames = self._frames
             capture_rate = self._capture_rate
             overflowed = self._overflowed
+            native_error = self._native_error
 
         result = RecordingResult(
             capture_rate=capture_rate,
             overflowed=overflowed,
             duration=frames / max(1, capture_rate),
+            capture_error=str(native_error) if native_error is not None else None,
         )
         try:
             if not chunks or frames == 0:
-                result.error = "Нет записанного аудио"
+                if result.capture_error:
+                    result.error = f"Захват звука прервался: {result.capture_error}"
+                else:
+                    result.error = "Нет записанного аудио"
                 result.silent = True
                 with self._lock:
                     self._result = result
@@ -1470,7 +1496,7 @@ def probe_input_devices(cfg: Optional[Config] = None) -> str:
         lines.append("sounddevice не установлен — проверка невозможна.")
         return "\n".join(lines) + "\n"
 
-    refresh_input_devices()
+    refresh_input_devices(force=True)
     devices = list_input_devices()
     default = default_input_device()
     lines.append(f"Микрофонов найдено: {len(devices)}")

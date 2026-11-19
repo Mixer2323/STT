@@ -63,7 +63,3 @@ def set_enabled(enabled: bool) -> tuple[bool, str]:
     except OSError as exc:
         logger.warning("Не удалось изменить автозапуск: %s", exc)
         return False, f"Не удалось изменить автозапуск: {exc}"
-
-
-def actual_state() -> bool:
-    return is_enabled()

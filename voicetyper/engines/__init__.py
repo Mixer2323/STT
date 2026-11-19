@@ -6,7 +6,6 @@ from .base import (
     Segment,
     StreamSession,
     TranscriptionResult,
-    is_language_supported,
 )
 from .registry import (
     ENGINE_CLASSES,
@@ -21,7 +20,6 @@ __all__ = [
     "Segment",
     "StreamSession",
     "TranscriptionResult",
-    "is_language_supported",
     "ENGINE_CLASSES",
     "create_engine",
     "describe_engines",

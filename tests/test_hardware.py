@@ -135,3 +135,49 @@ def test_non_windows_is_not_gated_by_cudnn(
 
     assert device == "cuda"
     assert warnings == []
+
+
+def test_nvidia_smi_prefers_the_system_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voicetyper import hardware
+
+    system32 = tmp_path / "System32"
+    system32.mkdir()
+    trusted = system32 / "nvidia-smi.exe"
+    trusted.write_bytes(b"")
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setattr(sys, "platform", "win32")
+    planted = str(tmp_path / "planted" / "nvidia-smi.exe")
+    monkeypatch.setattr(hardware.shutil, "which", lambda _name: planted)
+
+    assert hardware._nvidia_smi_path() == str(trusted)
+
+
+def test_nvidia_smi_falls_back_to_path_when_system_copy_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voicetyper import hardware
+
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "nowhere"))
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(hardware.shutil, "which", lambda _name: "C:/tools/nvidia-smi.exe")
+
+    assert hardware._nvidia_smi_path() == "C:/tools/nvidia-smi.exe"
+
+
+def test_cuda_probe_is_skipped_without_the_nvidia_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Importing ctranslate2 costs seconds on a cold install; a machine without
+    # the NVIDIA driver must not pay for it on every start.
+    from voicetyper import hardware
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    assert hardware._has_nvidia_driver_libraries() is False
+    assert hardware._detect_ctranslate2() is False
+
+    (tmp_path / "System32").mkdir()
+    (tmp_path / "System32" / "nvcuda.dll").write_bytes(b"")
+    assert hardware._has_nvidia_driver_libraries() is True

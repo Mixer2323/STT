@@ -27,7 +27,6 @@ class Job:
     path: Path
     duration: float
     target: Optional[WindowTarget]
-    preferred_engine: Optional[str]
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -43,7 +42,6 @@ class PipelineResult:
     excluded_by: Optional[str] = None
     error: Optional[str] = None
     elapsed: float = 0.0
-    from_cache: bool = False
 
     @property
     def ok(self) -> bool:
@@ -92,7 +90,6 @@ class TranscriptionPipeline:
         duration: float,
         *,
         target: Optional[WindowTarget] = None,
-        preferred_engine: Optional[str] = None,
     ) -> Optional[int]:
         path = Path(path)
         if self._stopped.is_set():
@@ -110,7 +107,6 @@ class TranscriptionPipeline:
             path=path,
             duration=duration,
             target=target,
-            preferred_engine=preferred_engine,
         )
         try:
             self._queue.put_nowait(job)
@@ -146,12 +142,19 @@ class TranscriptionPipeline:
         lease = None
         try:
             try:
-                lease = self._models.acquire(
-                    timeout=self._acquire_timeout,
-                    preferred_name=job.preferred_engine,
-                )
+                lease = self._models.acquire(timeout=self._acquire_timeout)
             except EngineNotReady as exc:
-                raise RuntimeError(str(exc)) from exc
+                # The idle-unload timer may have released the model a moment
+                # before this job started. Ask for a load and wait once; a
+                # genuinely unavailable engine still fails immediately.
+                self._models.request()
+                status = self._models.status
+                if status.error is not None and not self._models.loading:
+                    raise RuntimeError(str(exc)) from exc
+                try:
+                    lease = self._models.acquire(timeout=self._acquire_timeout)
+                except EngineNotReady as retry_exc:
+                    raise RuntimeError(str(retry_exc)) from retry_exc
 
             engine = lease.engine
             engine_name = lease.name

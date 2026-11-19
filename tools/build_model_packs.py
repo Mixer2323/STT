@@ -28,7 +28,9 @@ PACKS = {
     },
     "whisper-large-v3-turbo": {
         "asset": "VoiceTyper-models-whisper-large-v3-turbo.zip",
-        "source": MODELS / "faster_whisper" / "large-v3-turbo",
+        # Must match ``WhisperEngine._local_dir`` and the README table: the
+        # engine loads the snapshot from this exact folder name.
+        "source": MODELS / "faster_whisper" / "mobiuslabsgmbh--faster-whisper-large-v3-turbo",
         "files": [
             "config.json",
             "model.bin",

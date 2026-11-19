@@ -20,7 +20,11 @@ _INLINE_FILLER = re.compile(
     r"(^|,\s*)(?:это самое|как бы|так сказать|собственно говоря)\s*(?:,\s*|$)",
     re.IGNORECASE,
 )
-_SENTENCE_START = re.compile(r"(^|[.!?]\s+)([a-zа-яё])")
+_SENTENCE_START = re.compile(r"(^|[.!?…]\s+)([a-zа-яё])")
+# A single letter followed by a period is almost always an abbreviation
+# ("т. д.", "т. е.", "и т. п.") or an initial ("А. С. Пушкин"), not the end of
+# a sentence, so the word after it must keep its original case.
+_SINGLE_LETTER_TAIL = re.compile(r"(?:^|[^\w])([^\W\d_])\s*$", re.UNICODE)
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 _TRAILING_PUNCT = " \t\r\n.,!?;:…—–-\"'«»"
 
@@ -43,8 +47,19 @@ def remove_fillers(text: str) -> str:
     return cleaned.strip(" ,;")
 
 
+def _follows_single_letter_abbreviation(text: str, letter_index: int) -> bool:
+    """True when the punctuation before ``letter_index`` closes "т. д."/"A. B."."""
+    prefix = text[:letter_index].rstrip()
+    if not prefix or prefix[-1] not in ".!?…":
+        return False
+    before_period = prefix[:-1].rstrip()
+    return bool(_SINGLE_LETTER_TAIL.search(before_period))
+
+
 def capitalize_sentences(text: str) -> str:
     def upper(match: re.Match[str]) -> str:
+        if match.start(1) and _follows_single_letter_abbreviation(text, match.start(2)):
+            return match.group(0)
         return match.group(1) + match.group(2).upper()
 
     return _SENTENCE_START.sub(upper, text)

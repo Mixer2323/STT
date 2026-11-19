@@ -48,3 +48,13 @@ def test_delete_entry(tmp_path: Path) -> None:
     assert store.delete(entry_id) is True
     assert store.count() == 0
     assert store.delete(entry_id) is False
+
+
+def test_csv_export_neutralizes_spreadsheet_formulas(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "history.db")
+    store.add("=cmd|' /C calc'!A0", app="@SUM(1)")
+    destination = store.export_csv(tmp_path / "history.csv")
+    content = destination.read_text(encoding="utf-8-sig")
+
+    assert "'=cmd" in content
+    assert "'@SUM" in content

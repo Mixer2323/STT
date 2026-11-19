@@ -38,7 +38,11 @@ class StreamSession(Protocol):
         """Consume int16 mono audio and return the current preview text."""
 
     def finish(self) -> str:
-        """Finalize the stream and return the preview text."""
+        """Finalize the stream and return the preview text.
+
+        Reserved for a future streaming-insertion mode: the tray preview only
+        needs ``feed_pcm16``/``close`` and drops the unfinished tail on purpose.
+        """
 
     def close(self) -> None:
         ...
@@ -87,9 +91,3 @@ class Engine:
 
     def __exit__(self, *_exc) -> None:
         self.release()
-
-
-def is_language_supported(engine: Engine, language: Optional[str]) -> bool:
-    if not language or language == "auto" or engine.languages is None:
-        return True
-    return language in engine.languages

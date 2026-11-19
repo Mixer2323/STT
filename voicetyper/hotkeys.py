@@ -275,25 +275,50 @@ class HotkeyManager:
             ensure_hotkey_is_safe(keys)
             self._running = True
             self._keys = keys
+            handler = None
+            hook = None
             try:
-                self._handler = keyboard.add_hotkey(
+                handler = keyboard.add_hotkey(
                     normalized,
                     self._pressed,
                     suppress=True,
                     trigger_on_release=False,
                 )
-                self._hook = keyboard.hook(self._key_event, suppress=False)
+                hook = keyboard.hook(self._key_event, suppress=False)
+                self._worker = threading.Thread(
+                    target=self._event_worker, name="hotkey-events", daemon=True
+                )
+                self._worker.start()
             except Exception as exc:
+                # ``add_hotkey(suppress=True)`` swallows the combination
+                # system-wide. If a later step fails, the registration must be
+                # removed here, otherwise the key stays dead for every
+                # application until the process exits.
+                if handler is not None:
+                    try:
+                        keyboard.remove_hotkey(handler)
+                    except Exception:
+                        logger.debug(
+                            "Не удалось снять частично зарегистрированную горячую клавишу",
+                            exc_info=True,
+                        )
+                if hook is not None:
+                    try:
+                        keyboard.unhook(hook)
+                    except Exception:
+                        logger.debug(
+                            "Не удалось снять перехват после ошибки запуска",
+                            exc_info=True,
+                        )
                 self._running = False
                 self._keys = []
                 self._handler = None
                 self._hook = None
+                self._worker = None
                 raise HotkeyError(f"Не удалось зарегистрировать {normalized}: {exc}") from exc
+            self._handler = handler
+            self._hook = hook
             self._bound = normalized
-            self._worker = threading.Thread(
-                target=self._event_worker, name="hotkey-events", daemon=True
-            )
-            self._worker.start()
         logger.info("Горячая клавиша активна: %s", normalized)
 
     def rebind(self, hotkey: str) -> str:

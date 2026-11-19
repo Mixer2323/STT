@@ -46,6 +46,18 @@ WHISPER_REPOS = {
     "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
 
+# Pinned commits of the model repositories. Pinning keeps the downloaded
+# weights reproducible and prevents a repository update from silently changing
+# what the application loads; the LFS files are also verified by SHA-256.
+WHISPER_REVISIONS = {
+    "tiny": "d90ca5fe260221311c53c58e660288d3deb8d356",
+    "base": "ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66",
+    "small": "536b0662742c02347bc0e980a01041f333bce120",
+    "medium": "08e178d48790749d25932bbc082711ddcfdfbc4f",
+    "large-v3": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+    "large-v3-turbo": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+}
+
 WHISPER_FILES = (
     "config.json",
     "preprocessor_config.json",
@@ -146,6 +158,7 @@ GIGASTT_SOURCES = (
 )
 
 TONE_REPO = "t-tech/T-one"
+TONE_REVISION = "106f3b0b32a9e107eb613312e4ebc61ff3d53926"
 TONE_FILES = ("model.onnx", "kenlm.bin")
 
 TONE_DECODERS = ("auto", "beam_search", "greedy")

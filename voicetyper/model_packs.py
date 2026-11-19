@@ -128,7 +128,20 @@ def _extract(
     cancel_event: Optional[threading.Event],
 ) -> None:
     expected = set(pack.files)
+    # Archives are stored uncompressed today, but the size of an archive is
+    # attacker-controlled as soon as the download source is swapped (a mirror or
+    # a hijacked release). Refuse an archive that claims to expand far beyond
+    # the published pack size instead of filling the disk.
+    size_limit = max(pack.size * 4, 16 * 1024 * 1024)
     with zipfile.ZipFile(archive_path) as archive:
+        declared = sum(
+            info.file_size for info in archive.infolist() if not info.is_dir()
+        )
+        if declared > size_limit:
+            raise DownloadError(
+                f"Архив {pack.asset} распаковывается в {human_size(declared)} — "
+                f"это больше ожидаемого; загрузка отклонена"
+            )
         for info in archive.infolist():
             if info.is_dir():
                 continue
@@ -211,7 +224,21 @@ def download_pack(
         )
         _report(report, f"{pack.title}: распаковка архива", None)
         _extract(archive_path, target_dir, pack, cancel_event)
-    finally:
+    except DownloadCancelled:
+        archive_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        # The archive itself is already verified by its SHA-256. Keep it when
+        # unpacking failed (for example a full disk): the next attempt reuses
+        # the downloaded gigabyte instead of starting from zero.
+        if archive_path.exists():
+            logger.warning(
+                "Не удалось распаковать %s; архив сохранён для повторной попытки",
+                pack.asset,
+                exc_info=True,
+            )
+        raise
+    else:
         archive_path.unlink(missing_ok=True)
 
     _report(report, f"{pack.title}: модель готова", 100.0)

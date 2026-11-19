@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from .config import Config, ConfigStore
 from .constants import STATUS_ERROR, STATUS_IDLE, STATUS_LOADING, STATUS_READY
 from .engines import Engine, create_engine, resolve_engine_name
-from .hardware import detect_hardware
+from .hardware import cached_hardware
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,7 @@ class ModelManager:
         self._loading = False
         self._target_name: Optional[str] = None
         self._pending_name: Optional[str] = None
+        self._pending_force = False
         self._cancel = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._status = ModelStatus()
@@ -160,23 +161,12 @@ class ModelManager:
                     return False
                 self._condition.wait(remaining)
 
-    def acquire(
-        self,
-        timeout: float = 120.0,
-        preferred_name: Optional[str] = None,
-    ) -> EngineLease:
+    def acquire(self, timeout: float = 120.0) -> EngineLease:
         deadline = time.monotonic() + timeout
         with self._condition:
             while True:
                 current = self._current
                 if current is not None:
-                    if preferred_name and current.name != preferred_name and self._loading:
-                        # A queued job may wait briefly for the engine it expects.
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        self._condition.wait(min(remaining, 0.5))
-                        continue
                     current.refs += 1
                     return EngineLease(self, current)
                 if not self._loading:
@@ -188,13 +178,34 @@ class ModelManager:
                 self._condition.wait(remaining)
         raise EngineNotReady("Модель не успела загрузиться за отведённое время")
 
+    def unload(self) -> bool:
+        """Drop the loaded engine when nothing is using it.
+
+        Returns ``False`` while a lease is held or a load is in progress. The
+        next lease request is served by an on-demand ``request()`` from the app.
+        """
+        with self._lock:
+            current = self._current
+            if self._closed or current is None or self._loading or current.refs > 0:
+                return False
+            self._current = None
+            current.retired = True
+            current.released = True
+        self._release_engine(current)
+        self._publish(ModelStatus(state=STATUS_IDLE, message="Модель выгружена"))
+        logger.info("Модель выгружена из памяти")
+        return True
+
     # -- loading ---------------------------------------------------------
     def request(self, force: bool = False, cfg: Optional[Config] = None) -> None:
         cfg = cfg or self._store.get()
         with self._lock:
             if self._closed:
                 return
-        hw = detect_hardware()
+        # ``request`` runs on the UI/tray thread when settings are applied, so it
+        # must never spawn nvidia-smi (up to 6 s) again: the hardware snapshot is
+        # cached for the process lifetime.
+        hw = cached_hardware()
         name = resolve_engine_name(cfg, hw)
         if name == "none":
             error = (
@@ -210,6 +221,10 @@ class ModelManager:
                 self._current and self._current.name == name and not force
             )
             if same_ready:
+                if self._loading:
+                    # Another engine is being prepared right now; keep its
+                    # LOADING status instead of briefly showing READY.
+                    return
                 ready_status = ModelStatus(
                     state=STATUS_READY,
                     engine=name,
@@ -219,12 +234,21 @@ class ModelManager:
             elif self._loading:
                 if name != self._target_name:
                     self._pending_name = name
+                    self._pending_force = False
                     logger.info("Текущая загрузка идёт, отложен запрос: %s", name)
+                elif force:
+                    # "Перезагрузить модель" while that engine is already being
+                    # loaded: queue a fresh attempt instead of silently ignoring
+                    # the request (the user sees a stuck download otherwise).
+                    self._pending_name = name
+                    self._pending_force = True
+                    logger.info("Отложена принудительная перезагрузка: %s", name)
                 return
             else:
                 self._loading = True
                 self._target_name = name
                 self._pending_name = None
+                self._pending_force = False
                 self._cancel.clear()
                 self._thread = threading.Thread(
                     target=self._worker,
@@ -239,13 +263,37 @@ class ModelManager:
 
     def _worker(self, cfg: Config, name: str, force: bool) -> None:
         while True:
-            self._load_one(cfg, name, force)
+            try:
+                self._load_one(cfg, name, force)
+            except Exception as exc:
+                # ``_load_one`` handles its own errors; this guard exists for
+                # failures outside it (a raising ``engine.release()`` on cancel,
+                # for example). Without it the loader thread would die with
+                # ``_loading`` stuck True and every lease request would wait for
+                # the full timeout.
+                logger.exception("Неожиданная ошибка загрузки модели %s", name)
+                with self._lock:
+                    current = self._current
+                message = f"Не удалось загрузить {name}: {exc}"
+                if current is not None:
+                    message += f". Продолжает работать {current.name}"
+                self._publish(
+                    ModelStatus(
+                        state=STATUS_READY if current is not None else STATUS_ERROR,
+                        engine=current.name if current else name,
+                        message=message,
+                        error=str(exc),
+                    )
+                )
             with self._lock:
                 pending = self._pending_name
+                pending_force = self._pending_force
                 self._pending_name = None
-                if pending and pending != (self._current.name if self._current else None):
+                self._pending_force = False
+                current_name = self._current.name if self._current else None
+                if pending and (pending_force or pending != current_name):
                     name = pending
-                    force = False
+                    force = pending_force
                     self._target_name = name
                     cfg = self._store.get()
                     logger.info("Запуск отложенной загрузки: %s", name)
@@ -265,7 +313,7 @@ class ModelManager:
                 progress=0.0,
             )
         )
-        hw = detect_hardware()
+        hw = cached_hardware()
 
         warnings: list[str] = []
 
@@ -322,8 +370,16 @@ class ModelManager:
                 self._release_if_unused(old)
             for warning in warnings:
                 logger.warning("Модель %s: %s", name, warning)
-        except EngineNotReady:
-            pass
+        except EngineNotReady as exc:
+            logger.warning("Модель %s не готова: %s", name, exc)
+            self._publish(
+                ModelStatus(
+                    state=STATUS_ERROR,
+                    engine=name,
+                    message=f"Не удалось загрузить {name}: {exc}",
+                    error=str(exc),
+                )
+            )
         except Exception as exc:
             if self._cancel.is_set():
                 logger.info("Загрузка %s прервана", name)

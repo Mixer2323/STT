@@ -15,7 +15,7 @@ from typing import Optional
 
 from .. import paths
 from ..config import Config
-from ..constants import WHISPER_FILES, WHISPER_REPOS
+from ..constants import WHISPER_FILES, WHISPER_REPOS, WHISPER_REVISIONS
 from ..downloads import DownloadCancelled, DownloadError, download_hf_files, human_size
 from ..hardware import HardwareInfo, resolve_whisper_runtime
 from ..model_packs import download_pack
@@ -97,6 +97,7 @@ class WhisperEngine(Engine):
                 cancel_event=self._cancel,
                 required="model.bin",
                 ignore_missing=True,
+                revision=WHISPER_REVISIONS.get(self.cfg.whisper_model),
             )
         except DownloadError as exc:
             if (self.model_dir / "model.bin").exists():

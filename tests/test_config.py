@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from voicetyper.config import Config, ConfigStore, validate_mapping
 
 
@@ -12,7 +14,6 @@ def test_defaults_and_roundtrip(tmp_path: Path) -> None:
     assert store.load() == []
     assert path.exists()
     assert store.get().hotkey == "ctrl+alt+space"
-
     store.update(
         model_type="faster_whisper", language="en", beam_size=3, history_limit=50
     )
@@ -111,3 +112,48 @@ def test_persisted_json_has_schema_version(tmp_path: Path) -> None:
     store.load()
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["version"] == 3
+
+
+def test_save_failure_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import voicetyper.config as config_module
+
+    path = tmp_path / "config.json"
+    store = ConfigStore(path)
+    store.load()
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(config_module, "_atomic_json_write", boom)
+    store.update(beam_size=7)
+
+    # The change is applied in memory but the caller can see that it was not
+    # persisted, so the UI can warn instead of promising success.
+    assert store.last_save_ok is False
+    assert store.get().beam_size == 7
+
+    monkeypatch.undo()
+    store.update(beam_size=8)
+    assert store.last_save_ok is True
+    assert json.loads(path.read_text(encoding="utf-8"))["beam_size"] == 8
+
+def test_unload_model_after_minutes_is_bounded() -> None:
+    assert validate_mapping({"unload_model_after_minutes": 999})[0].unload_model_after_minutes == 240
+    assert validate_mapping({"unload_model_after_minutes": -5})[0].unload_model_after_minutes == 0
+    assert validate_mapping({"unload_model_after_minutes": "60"})[0].unload_model_after_minutes == 60
+
+
+def test_valid_config_is_not_rewritten_on_every_start(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    ConfigStore(path).load()
+    before = path.stat().st_mtime_ns
+
+    ConfigStore(path).load()
+
+    assert path.stat().st_mtime_ns == before
+
+
+def test_restore_delay_is_bounded_and_defaulted() -> None:
+    assert validate_mapping({"restore_delay_ms": 9999})[0].restore_delay_ms == 2000
+    assert validate_mapping({"restore_delay_ms": -1})[0].restore_delay_ms == 0
+    assert validate_mapping({"restore_delay_ms": "abc"})[0].restore_delay_ms == 300

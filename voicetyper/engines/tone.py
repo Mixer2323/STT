@@ -13,7 +13,7 @@ import numpy as np
 from .. import paths
 from ..audio import StreamingDownsampler, load_audio_int32_8k
 from ..config import Config
-from ..constants import TONE_REPO
+from ..constants import TONE_REPO, TONE_REVISION
 from ..downloads import DownloadCancelled, DownloadError, download_hf_files, human_size
 from ..hardware import HardwareInfo, choose_tone_decoder
 from ..model_packs import download_pack
@@ -28,8 +28,11 @@ _TONE_RATE = 8000
 class ToneStreamSession(StreamSession):
     """Adapts 16 kHz int16 microphone blocks to T-one's 8 kHz int32 chunks."""
 
-    def __init__(self, pipeline):
+    def __init__(self, pipeline, inference_lock: Optional[threading.RLock] = None):
         self._pipeline = pipeline
+        # The preview stream and the file transcription share one pipeline
+        # instance; ONNX Runtime is thread-safe, the pyctcdecode decoder is not.
+        self._inference_lock = inference_lock or threading.RLock()
         self._lock = threading.Lock()
         self._downsampler: Optional[StreamingDownsampler] = None
         self._buffer = np.zeros(0, dtype=np.int16)
@@ -38,9 +41,10 @@ class ToneStreamSession(StreamSession):
         self._closed = False
 
     def _consume(self, chunk: np.ndarray, is_last: bool) -> None:
-        phrases, self._state = self._pipeline.forward(
-            chunk.astype(np.int32, copy=False), self._state, is_last=is_last
-        )
+        with self._inference_lock:
+            phrases, self._state = self._pipeline.forward(
+                chunk.astype(np.int32, copy=False), self._state, is_last=is_last
+            )
         for phrase in phrases or []:
             text = str(getattr(phrase, "text", "") or "").strip()
             if text:
@@ -75,12 +79,14 @@ class ToneStreamSession(StreamSession):
                 if self._buffer.size:
                     padded = np.zeros(_TONE_CHUNK, dtype=np.int16)
                     padded[: min(self._buffer.size, _TONE_CHUNK)] = self._buffer[:_TONE_CHUNK]
-                    phrases, self._state = self._pipeline.forward(
-                        padded.astype(np.int32), self._state, is_last=False
-                    )
+                    with self._inference_lock:
+                        phrases, self._state = self._pipeline.forward(
+                            padded.astype(np.int32), self._state, is_last=False
+                        )
                     self._append(phrases)
                     self._buffer = np.zeros(0, dtype=np.int16)
-                phrases, self._state = self._pipeline.finalize(self._state)
+                with self._inference_lock:
+                    phrases, self._state = self._pipeline.finalize(self._state)
                 self._append(phrases)
             except Exception:
                 logger.debug("Ошибка завершения стрима T-one", exc_info=True)
@@ -116,6 +122,7 @@ class ToneEngine(Engine):
         self.decoder_name = "greedy"
         self.warnings: list[str] = []
         self._model_dir = paths.models_dir() / "tone"
+        self._inference_lock = threading.RLock()
         self._load()
 
     def _progress_wrapper(self, label: str):
@@ -152,6 +159,7 @@ class ToneEngine(Engine):
                 cancel_event=self._cancel,
                 required="model.onnx",
                 ignore_missing=True,
+                revision=TONE_REVISION,
             )
         except DownloadError as exc:
             if not (self._model_dir / "model.onnx").exists():
@@ -200,14 +208,15 @@ class ToneEngine(Engine):
     def start_stream(self) -> Optional[StreamSession]:
         if self.pipeline is None:
             return None
-        return ToneStreamSession(self.pipeline)
+        return ToneStreamSession(self.pipeline, self._inference_lock)
 
     def transcribe(self, path: Path, language: Optional[str] = None) -> TranscriptionResult:
         if self.pipeline is None:
             raise EngineError("T-one не загружен")
         try:
             audio = load_audio_int32_8k(path)
-            phrases = self.pipeline.forward_offline(audio)
+            with self._inference_lock:
+                phrases = self.pipeline.forward_offline(audio)
         except Exception as exc:
             raise EngineError(f"T-one не смог распознать аудио: {exc}") from exc
 
@@ -234,8 +243,9 @@ class ToneEngine(Engine):
         )
 
     def release(self) -> None:
-        pipeline = self.pipeline
-        self.pipeline = None
+        with self._inference_lock:
+            pipeline = self.pipeline
+            self.pipeline = None
         if pipeline is None:
             gc.collect()
             return

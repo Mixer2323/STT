@@ -81,3 +81,22 @@ def test_language_menu_is_limited_without_whisper(tmp_path, monkeypatch) -> None
     items = _language_items(tray_module.TrayController(_MenuApp(False), store).build_menu())
     assert len(items) > 1
     assert all(item.enabled for item in items)
+
+
+def test_cjk_language_codes_are_detected_for_font_selection() -> None:
+    assert tray_module._contains_cjk("中")
+    assert tray_module._contains_cjk("日")
+    assert not tray_module._contains_cjk("RU")
+    assert not tray_module._contains_cjk("EN")
+
+
+def test_menu_offers_a_hotkey_reset(tmp_path, monkeypatch) -> None:
+    # A lost key-up leaves the press latch set; the menu item is the manual way
+    # out without restarting the application.
+    monkeypatch.setattr(tray_module, "describe_engines", lambda: {})
+    store = ConfigStore(tmp_path / "config.json")
+    store.load()
+
+    menu = tray_module.TrayController(_MenuApp(recording=False), store).build_menu()
+
+    assert "Сбросить горячую клавишу" in [item.text for item in menu.items]

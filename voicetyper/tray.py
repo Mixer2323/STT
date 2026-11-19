@@ -24,6 +24,7 @@ from .constants import (
 )
 from .engines import describe_engines
 from .hardware import config_accepts_language
+from .labels import LANGUAGE_CODES, LANGUAGE_LABELS, TONE_DECODER_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +40,8 @@ except Exception:
     ImageFont = None
     HAS_TRAY = False
 
-_LANGUAGE_LABELS = {
-    "auto": "Авто",
-    "ru": "Русский",
-    "en": "English",
-    "de": "Deutsch",
-    "fr": "Français",
-    "es": "Español",
-    "it": "Italiano",
-    "pt": "Português",
-    "zh": "中文",
-    "ja": "日本語",
-}
-_LANGUAGE_CODES = {"auto": "A", "ru": "RU", "en": "EN", "de": "DE", "fr": "FR", "es": "ES", "it": "IT", "pt": "PT", "zh": "中", "ja": "日"}
+_LANGUAGE_LABELS = LANGUAGE_LABELS
+_LANGUAGE_CODES = LANGUAGE_CODES
 
 _STATE_COLORS = {
     STATUS_IDLE: (0, 122, 66),
@@ -70,19 +60,30 @@ _STATE_GLYPHS = {
 
 _font_cache: dict[tuple[str, int], Any] = {}
 _icon_cache: dict[tuple[str, str], Any] = {}
+_CJK_FONTS = ("msyhbd.ttc", "msyh.ttc", "YuGothB.ttc", "meiryo.ttc", "simhei.ttf")
 
 
-def _font(size: int):
-    key = ("arialbd.ttf", size)
+def _contains_cjk(text: str) -> bool:
+    return any(
+        "\u2e80" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff" or "\uff00" <= char <= "\uffef"
+        for char in text
+    )
+
+
+def _font(size: int, *, cjk: bool = False):
+    candidates = _CJK_FONTS + ("arialbd.ttf", "arial.ttf") if cjk else ("arialbd.ttf", "arial.ttf")
+    key = (candidates[0], size)
     if key in _font_cache:
         return _font_cache[key]
-    try:
-        font = ImageFont.truetype("arialbd.ttf", size)
-    except Exception:
+    font = None
+    for name in candidates:
         try:
-            font = ImageFont.truetype("arial.ttf", size)
+            font = ImageFont.truetype(name, size)
+            break
         except Exception:
-            font = ImageFont.load_default()
+            continue
+    if font is None:
+        font = ImageFont.load_default()
     _font_cache[key] = font
     return font
 
@@ -100,7 +101,7 @@ def create_image(text: str, state: str = STATUS_IDLE, size: int = 64):
     draw.rectangle([0, 0, size - 1, size - 1], outline=tuple(max(0, c - 35) for c in color))
     length = max(1, len(text))
     font_size = 22 if length <= 2 else 16 if length == 3 else 12
-    font = _font(font_size)
+    font = _font(font_size, cjk=_contains_cjk(text))
     try:
         left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
         width, height = right - left, bottom - top
@@ -128,6 +129,7 @@ class TrayController:
         self._last_key = None
         self._refresh_lock = threading.Lock()
         self._refresh_pending = False
+        self._state_lock = threading.RLock()
         self._available = HAS_TRAY
 
     @property
@@ -175,16 +177,6 @@ class TrayController:
             except Exception:
                 logger.debug("Не удалось остановить трей", exc_info=True)
 
-    def notify(self, title: str, message: str) -> bool:
-        if self._icon is None:
-            return False
-        try:
-            self._icon.notify(message, title)
-            return True
-        except Exception:
-            logger.debug("Уведомление трея не показано", exc_info=True)
-            return False
-
     # -- state -----------------------------------------------------------
     def set_state(
         self,
@@ -194,27 +186,36 @@ class TrayController:
         engine: Optional[str] = None,
         progress: Optional[float] = None,
     ) -> None:
-        if engine is not None:
-            self._engine = engine
-        key = (state, message, round(progress) if progress is not None else None, self._engine)
-        if key == self._last_key:
-            return
-        state_changed = state != self._state
-        self._last_key = key
-        self._state = state
-        self._message = message
-        self._progress = progress
-        cfg = self._store.get()
-        icon = self._icon
-        if icon is None:
-            return
-        try:
-            icon.icon = self._image_for(cfg)
-            icon.title = self._title(cfg)
-        except Exception:
-            logger.debug("Не удалось обновить иконку трея", exc_info=True)
-        if state_changed:
-            self.refresh_menu()
+        # Called from the audio callback, hotkey worker, model loader and
+        # pipeline threads; serialize so the icon, title and menu always
+        # describe one consistent state.
+        with self._state_lock:
+            if engine is not None:
+                self._engine = engine
+            key = (
+                state,
+                message,
+                round(progress) if progress is not None else None,
+                self._engine,
+            )
+            if key == self._last_key:
+                return
+            state_changed = state != self._state
+            self._last_key = key
+            self._state = state
+            self._message = message
+            self._progress = progress
+            cfg = self._store.get()
+            icon = self._icon
+            if icon is None:
+                return
+            try:
+                icon.icon = self._image_for(cfg)
+                icon.title = self._title(cfg)
+            except Exception:
+                logger.debug("Не удалось обновить иконку трея", exc_info=True)
+            if state_changed:
+                self.refresh_menu()
 
     def _image_for(self, cfg):
         glyph = _STATE_GLYPHS.get(self._state)
@@ -328,11 +329,7 @@ class TrayController:
                 self._action(self._app.set_tone_decoder, value),
                 checked=self._checked("tone_decoder", value),
             )
-            for value, label in (
-                ("auto", "Авто (по железу)"),
-                ("beam_search", "Beam search (точнее)"),
-                ("greedy", "Greedy (легче)"),
-            )
+            for value, label in TONE_DECODER_LABELS.items()
         ]
 
         mode_items = [
@@ -370,6 +367,10 @@ class TrayController:
             pystray.MenuItem("Декодер T-one", pystray.Menu(*tone_items)),
             pystray.MenuItem("Режим клавиши", pystray.Menu(*mode_items)),
             pystray.MenuItem(hotkey_label, None, enabled=False),
+            pystray.MenuItem(
+                "Сбросить горячую клавишу",
+                self._action(self._app.reset_hotkey),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Запускать при входе",
@@ -378,7 +379,12 @@ class TrayController:
             ),
             pystray.MenuItem("Открыть папку данных", self._action(self._app.open_data_dir)),
             pystray.MenuItem("Открыть логи", self._action(self._app.open_logs)),
+            pystray.MenuItem(
+                "Очистить старые кэши моделей…",
+                self._action(self._app.cleanup_old_model_caches),
+            ),
             pystray.MenuItem("Перезагрузить модель", self._action(self._app.reload_model)),
+            pystray.MenuItem("Выгрузить модель", self._action(self._app.unload_model)),
             pystray.MenuItem("Диагностика", self._action(self._app.run_diagnostics)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", self._action(self._app.shutdown)),

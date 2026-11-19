@@ -42,9 +42,9 @@ class Notifier:
             return False
         now = time.monotonic()
         with self._lock:
-            if not force and key:
+            if key:
                 last = self._last.get(key, 0.0)
-                if now - last < cooldown:
+                if not force and now - last < cooldown:
                     return False
                 self._last[key] = now
             icon = self._icon

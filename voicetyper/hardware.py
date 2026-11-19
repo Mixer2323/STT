@@ -133,14 +133,15 @@ def _free_disk_gb(path: str) -> Optional[float]:
 
 
 def _nvidia_smi_path() -> Optional[str]:
-    found = shutil.which("nvidia-smi")
-    if found:
-        return found
+    # Prefer the OS-owned copy: resolving it through %PATH% first would execute
+    # an arbitrary ``nvidia-smi.exe`` planted in a user-writable directory.
     if sys.platform == "win32":
-        candidate = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe")
+        candidate = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe"
+        )
         if os.path.isfile(candidate):
             return candidate
-    return None
+    return shutil.which("nvidia-smi")
 
 
 def _detect_nvidia_smi() -> tuple[bool, Optional[str], Optional[float]]:
@@ -176,7 +177,23 @@ def _detect_nvidia_smi() -> tuple[bool, Optional[str], Optional[float]]:
     return True, name, vram
 
 
+def _has_nvidia_driver_libraries() -> bool:
+    """Cheap proxy for "a CUDA-capable driver is installed".
+
+    ``import ctranslate2`` takes seconds on a cold install, so it must not be
+    the first thing tried on a machine that has no NVIDIA driver at all. The
+    CUDA driver API library lives in System32 whenever the driver is present.
+    """
+    if sys.platform != "win32":
+        return True
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.isfile(os.path.join(root, "System32", "nvcuda.dll"))
+
+
 def _detect_ctranslate2() -> bool:
+    if not _has_nvidia_driver_libraries():
+        logger.debug("NVIDIA-драйвер не найден — проверка CUDA через ctranslate2 пропущена")
+        return False
     try:
         import ctranslate2
 
@@ -305,11 +322,3 @@ def config_accepts_language(
         availability = engine_availability()
     hw = HardwareInfo(cpu_cores=os.cpu_count() or 1, ram_gb=_ram_gb())
     return choose_engine_name(cfg, hw, availability) in MULTILINGUAL_ENGINES
-
-
-def format_bytes(size: float) -> str:
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if abs(size) < 1024 or unit == "ТБ":
-            return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} Б"
-        size /= 1024
-    return f"{size:.1f} ТБ"

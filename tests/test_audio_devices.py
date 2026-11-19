@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from types import SimpleNamespace
 
@@ -205,9 +206,7 @@ def test_device_switched_in_windows_is_followed(monkeypatch: pytest.MonkeyPatch)
         second.stop()
 
 
-def test_device_list_is_refreshed_before_every_recording(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_device_list_refresh_is_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _use(monkeypatch, FakeSoundDevice(_machine(), 1, wasapi_default=2))
 
     for _attempt in range(2):
@@ -215,7 +214,37 @@ def test_device_list_is_refreshed_before_every_recording(
         session.start()
         session.stop()
 
+    # Re-initializing PortAudio before every dictation delayed the first words;
+    # an immediate second recording reuses the fresh device list.
+    assert fake.refreshed == 1
+    assert audio.refresh_input_devices(force=True)
     assert fake.refreshed == 2
+
+
+def test_successful_format_is_reused_for_the_same_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _use(monkeypatch, FakeSoundDevice(_machine(), 1, wasapi_default=2))
+    audio._FORMAT_CACHE[2] = (44100, 1)
+
+    stream, rate, channels, _index = audio.RecordingSession(
+        Config(input_device=2)
+    )._open_target(2)
+
+    assert (rate, channels) == (44100, 1)
+    assert fake.opened[0] == (2, 44100, 1)
+    stream.close()
+
+
+def test_refreshing_devices_forgets_the_format_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use(monkeypatch, FakeSoundDevice(_machine(), 1, wasapi_default=2))
+    audio._FORMAT_CACHE[2] = (48000, 2)
+
+    assert audio.refresh_input_devices(force=True)
+
+    assert audio._FORMAT_CACHE == {}
 
 
 def test_only_the_target_device_is_tried(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -464,6 +493,77 @@ def test_media_foundation_failure_is_remembered(
     assert len(calls) == 1  # the second attempt is skipped by the negative cache
 
 
+class _DyingRecorder(FakeRecorder):
+    """Fails in the middle of a recording, like an unplugged headset."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def record(self, numframes: int) -> np.ndarray:
+        self.calls += 1
+        if self.calls > 2:
+            raise RuntimeError("устройство отключено")
+        return np.zeros((numframes, 1), dtype=np.float32)
+
+
+def _rdp_media_foundation(monkeypatch: pytest.MonkeyPatch, device_name: str) -> None:
+    devices = [_device(2, device_name, hostapi=1, channels=1, rate=44100.0)]
+    fake = FakeSoundDevice(devices, default_index=2, wasapi_default=2, failing_devices={2})
+    _use(monkeypatch, fake)
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "HAS_MEDIA_FOUNDATION", True)
+    monkeypatch.setattr(audio, "is_remote_session", lambda: True)
+    monkeypatch.setattr(
+        audio,
+        "_find_soundcard_microphone",
+        lambda names: SimpleNamespace(name=device_name),
+    )
+
+
+def test_media_foundation_capture_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A dying endpoint used to leave the session looking healthy; the user only
+    # saw a silent transcript with no explanation.
+    _rdp_media_foundation(monkeypatch, "Удалённое аудио")
+    monkeypatch.setattr(
+        audio,
+        "open_recorder",
+        lambda microphone, seconds=0.1, preferred_rate=16000: _DyingRecorder(),
+    )
+
+    session = audio.RecordingSession(Config())
+    session.start()
+    deadline = time.monotonic() + 3
+    while session._native_error is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    result = session.stop()
+
+    assert result.capture_error is not None
+    assert "отключено" in result.capture_error
+
+
+def test_media_foundation_marks_a_server_side_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Media Foundation fallback is exactly the RDP path where recording from
+    # the server's own microphone must be reported to the user.
+    _rdp_media_foundation(monkeypatch, "FrontMic (Realtek HD Audio)")
+    monkeypatch.setattr(
+        audio,
+        "open_recorder",
+        lambda microphone, seconds=0.1, preferred_rate=16000: FakeRecorder(),
+    )
+
+    session = audio.RecordingSession(Config(input_device=2))
+    session.start()
+    try:
+        assert session.server_side_fallback
+    finally:
+        session.stop()
+
+
 def test_probe_input_devices_reports_every_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -511,3 +611,68 @@ def test_verdict_warns_when_the_redirect_endpoint_is_absent() -> None:
     report = "\n".join(lines)
     assert "Перенаправленного микрофона RDP в сеансе нет" in report
     assert "не подставляет автоматически" in report
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Media Foundation is Windows-only")
+def test_media_foundation_does_not_replace_a_named_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the chosen endpoint cannot be matched among several microphones,
+    # recording must fail instead of silently switching to the default one.
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(
+        audio,
+        "_soundcard_microphones",
+        lambda: [
+            SimpleNamespace(name="Микрофон (Realtek)"),
+            SimpleNamespace(name="Микрофон (USB)"),
+        ],
+    )
+    default = SimpleNamespace(name="Микрофон (Realtek)")
+    monkeypatch.setattr(
+        audio,
+        "sc",
+        SimpleNamespace(default_microphone=lambda: default),
+    )
+
+    assert audio._find_soundcard_microphone(["Удалённое аудио"]) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Media Foundation is Windows-only")
+def test_media_foundation_uses_the_only_microphone_when_the_name_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In an RDP session Windows localizes the endpoint name; with a single
+    # capture device there is nothing to confuse it with.
+    only = SimpleNamespace(name="Remote Audio")
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [only])
+
+    assert audio._find_soundcard_microphone(["Удалённое аудио"]) is only
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Media Foundation is Windows-only")
+def test_media_foundation_uses_the_default_when_no_name_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default = SimpleNamespace(name="Микрофон (Realtek)")
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [default])
+    monkeypatch.setattr(
+        audio,
+        "sc",
+        SimpleNamespace(default_microphone=lambda: default),
+    )
+
+    assert audio._find_soundcard_microphone([]) is default
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Media Foundation is Windows-only")
+def test_media_foundation_matches_a_redirected_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audio, "HAS_SOUNDCARD", True)
+    redirect = SimpleNamespace(name="Удалённое аудио")
+    monkeypatch.setattr(audio, "_soundcard_microphones", lambda: [redirect])
+
+    assert audio._find_soundcard_microphone(["Удалённое аудио"]) is redirect
